@@ -1,0 +1,11 @@
+/target/
+**/*.pyc
+**/__pycache__/
+.env
+evade-proxy.env
+*.tmp
+evade_stats.json
+data/
+.idea/
+.vscode/
+*.swp

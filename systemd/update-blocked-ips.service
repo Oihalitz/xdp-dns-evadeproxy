@@ -1,0 +1,15 @@
+[Unit]
+Description=Update blocked anycast IPs (public list + residential probe)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/evade-proxy.env
+Environment=XDP_PREFIX=/opt/xdp-dns-evadeproxy
+ExecStart=/opt/xdp-dns-evadeproxy/scripts/update-blocked-ips.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run update-blocked-ips every 15 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

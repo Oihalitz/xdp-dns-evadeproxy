@@ -1,0 +1,22 @@
+[package]
+name = "evade-proxy"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["Oihalitz", "mateodd1"]
+description = "DNS proxy that jumps over indiscriminate anycast IP blocks"
+repository = "https://github.com/Oihalitz/xdp-dns-evadeproxy"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = true

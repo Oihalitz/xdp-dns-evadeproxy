@@ -1,0 +1,27 @@
+[Unit]
+Description=xdp.es DNS evasion proxy (Rust)
+After=network.target unbound.service
+Wants=unbound.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/evade-proxy
+Restart=on-failure
+RestartSec=2
+User=root
+EnvironmentFile=-/etc/evade-proxy.env
+RuntimeDirectory=evade-proxy
+RuntimeDirectoryMode=0750
+StateDirectory=evade-proxy
+StateDirectoryMode=0750
+Environment=EVADE_STATS_FILE=/var/lib/evade-proxy/evade_stats.json
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadOnlyPaths=/etc/unbound
+ReadWritePaths=/var/lib/evade-proxy
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

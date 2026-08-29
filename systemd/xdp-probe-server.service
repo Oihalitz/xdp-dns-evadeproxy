@@ -1,0 +1,22 @@
+[Unit]
+Description=XDP probe ingest server (residential block detection)
+After=network-online.target unbound.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-/etc/evade-proxy.env
+Environment=XDP_PREFIX=/opt/xdp-dns-evadeproxy
+ExecStart=/usr/bin/python3 /opt/xdp-dns-evadeproxy/probe/probe-server.py
+Restart=always
+RestartSec=3s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Writes probe blocklists and evade-proxy temporary redirects.
+ReadWritePaths=/etc/unbound /run/evade-proxy
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=XDP residential DNS-block probe (home agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/xdp-probe.env
+ExecStart=/usr/bin/python3 /opt/xdp-probe/xdp-probe.py
+Restart=always
+RestartSec=5s
+DynamicUser=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
