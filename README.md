@@ -18,20 +18,35 @@ Desarrollado por [Oihalitz](https://github.com/Oihalitz) con [mateodd1](https://
 
 ---
 
-## Usar el DNS de xdp.es
+<div align="center">
 
-No hace falta clonar este repo. El servicio público ya corre evade-proxy — guía, perfiles Apple y copiar-y-pegar en **[xdp.es](https://xdp.es)**.
+<h3>Usar el DNS de xdp.es</h3>
 
-| | |
-|:---|:---|
-| **Web** | [https://xdp.es](https://xdp.es) |
-| **DNS** | `85.208.114.51` &nbsp; `2a0e:97c0:c40::51` |
-| **DoH** | `https://dns.xdp.es/dns-query` |
-| **DoT** | `dns.xdp.es` · puerto `853` |
-| **DoQ** | `quic://dns.xdp.es:853` |
-| **iOS / macOS** | [perfil DoH](https://xdp.es/dns_xdp_es_doh.mobileconfig) · [perfil DoT](https://xdp.es/dns_xdp_es_dot.mobileconfig) |
+<p>No hace falta clonar este repo. Guía y copiar-y-pegar en <a href="https://xdp.es">xdp.es</a>.</p>
 
-Zero-logs, DNSSEC, adblock. Si el ISP tumba un rango anycast entero, evade-proxy responde con un vecino que sigue sirviendo. Perfil Lite (sin adblock) también en [xdp.es](https://xdp.es).
+<h4>Adblock</h4>
+<p>publicidad y malware fuera · DNSSEC · zero-logs</p>
+<table align="center">
+  <tr><td align="right"><strong>Web</strong></td><td align="left"><a href="https://xdp.es">https://xdp.es</a></td></tr>
+  <tr><td align="right"><strong>DNS</strong></td><td align="left"><code>85.208.114.51</code> &nbsp; <code>2a0e:97c0:c40::51</code></td></tr>
+  <tr><td align="right"><strong>DoH</strong></td><td align="left"><code>https://dns.xdp.es/dns-query</code></td></tr>
+  <tr><td align="right"><strong>DoT</strong></td><td align="left"><code>dns.xdp.es</code> · puerto <code>853</code></td></tr>
+  <tr><td align="right"><strong>DoQ</strong></td><td align="left"><code>quic://dns.xdp.es:853</code></td></tr>
+  <tr><td align="right"><strong>iOS / macOS</strong></td><td align="left"><a href="https://xdp.es/dns_xdp_es_doh.mobileconfig">perfil DoH</a> · <a href="https://xdp.es/dns_xdp_es_dot.mobileconfig">perfil DoT</a></td></tr>
+</table>
+
+<h4>Standard</h4>
+<p>sin adblock · la misma evasión · DNSSEC · zero-logs</p>
+<table align="center">
+  <tr><td align="right"><strong>Web</strong></td><td align="left"><a href="https://xdp.es">https://xdp.es</a></td></tr>
+  <tr><td align="right"><strong>DNS</strong></td><td align="left"><code>85.208.114.52</code> &nbsp; <code>2a0e:97c0:c40::52</code></td></tr>
+  <tr><td align="right"><strong>DoH</strong></td><td align="left"><code>https://lite.xdp.es/dns-query</code></td></tr>
+  <tr><td align="right"><strong>DoT</strong></td><td align="left"><code>lite.xdp.es</code> · puerto <code>853</code></td></tr>
+  <tr><td align="right"><strong>DoQ</strong></td><td align="left"><code>quic://lite.xdp.es:853</code></td></tr>
+  <tr><td align="right"><strong>iOS / macOS</strong></td><td align="left"><a href="https://xdp.es/lite_xdp_es_doh.mobileconfig">perfil DoH</a> · <a href="https://xdp.es/lite_xdp_es_dot.mobileconfig">perfil DoT</a></td></tr>
+</table>
+
+</div>
 
 ---
 
