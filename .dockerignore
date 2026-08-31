@@ -1,0 +1,5 @@
+target
+.git
+.github
+*.md
+!README.md

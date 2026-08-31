@@ -123,6 +123,28 @@ handle /probe/* {
 
 No ejecutar a la vez que un `evade_proxy` en Python: mismos puertos.
 
+## Docker
+
+Alternativa a `install.sh` para quien prefiera contenedores. El stack de ejemplo
+levanta evade-proxy, un `unbound` recursivo con validación DNSSEC (su upstream
+en `127.0.0.1:5336`/`:5338`) y el bucle que sincroniza blocklist + prefijos
+Cloudflare:
+
+```sh
+cp evade-proxy.env.example evade-proxy.env   # PROBE_TOKEN=… si usas la sonda
+docker compose up -d --build
+```
+
+`unbound` y `blocklist-updater` se unen al *network namespace* de
+`evade-proxy` (`network_mode: "service:evade-proxy"`) porque el proxy siempre
+resuelve su upstream en `127.0.0.1` (ver tabla de puertos más abajo) — no hay
+forma de apuntarlo a otro contenedor por nombre de servicio.
+
+Para ponerlo delante de un servidor DNS que ya use `network_mode: host` en el
+mismo host (p. ej. AdGuard Home), añade `network_mode: host` al servicio
+`evade-proxy`, quita su bloque `ports:`, y apunta el DNS upstream de ese
+servidor a `127.0.0.1:5335`.
+
 ## Lista de IPs bloqueadas
 
 `scripts/update-blocked-ips.sh`, timer cada 15 s:
