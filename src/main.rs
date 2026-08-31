@@ -321,15 +321,21 @@ impl App {
             .read()
             .expect("redirect lock poisoned")
             .clone();
-        let domain = question_name(packet);
-        let test_redirect = domain
-            .as_ref()
-            .and_then(|domain| {
-                self.test_redirects
-                    .get(domain)
-                    .or_else(|| temporary_redirects.get(domain))
-            })
-            .filter(|redirect| redirect.expires_at.is_none_or(|expires| expires > epoch()));
+        // Decoding the question name allocates (labels, lowercasing, join). Only pay
+        // for it when some redirect rule actually exists — in production neither map
+        // is populated most of the time, so this is skipped on the common path.
+        let has_redirects = !self.test_redirects.is_empty() || !temporary_redirects.is_empty();
+        let test_redirect = if has_redirects {
+            question_name(packet)
+                .and_then(|domain| {
+                    self.test_redirects
+                        .get(&domain)
+                        .or_else(|| temporary_redirects.get(&domain))
+                })
+                .filter(|redirect| redirect.expires_at.is_none_or(|expires| expires > epoch()))
+        } else {
+            None
+        };
         if test_redirect.is_none() && data.blocked_v4.is_empty() && data.blocked_v6.is_empty() {
             return 0;
         }
