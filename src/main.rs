@@ -163,9 +163,38 @@ struct Data {
     blocked_v6: HashSet<u128>,
     cf_v4: Vec<(u32, u32)>,
     cf_v6: Vec<(u128, u128)>,
+    // Precomputed at reload time (blocked IP -> free neighbor), so the per-packet
+    // rewrite path is a HashMap lookup instead of re-scanning the prefix every time
+    // the same blocked anycast IP shows up in yet another answer.
+    evasion_v4: HashMap<u32, u32>,
+    evasion_v6: HashMap<u128, u128>,
 }
 
 impl Data {
+    fn new(
+        blocked_v4: HashSet<u32>,
+        blocked_v6: HashSet<u128>,
+        cf_v4: Vec<(u32, u32)>,
+        cf_v6: Vec<(u128, u128)>,
+    ) -> Self {
+        let evasion_v4 = blocked_v4
+            .iter()
+            .filter_map(|&ip| scan_evasive_v4(ip, &cf_v4, &blocked_v4).map(|new_ip| (ip, new_ip)))
+            .collect();
+        let evasion_v6 = blocked_v6
+            .iter()
+            .filter_map(|&ip| scan_evasive_v6(ip, &cf_v6, &blocked_v6).map(|new_ip| (ip, new_ip)))
+            .collect();
+        Self {
+            blocked_v4,
+            blocked_v6,
+            cf_v4,
+            cf_v6,
+            evasion_v4,
+            evasion_v6,
+        }
+    }
+
     async fn load(paths: &Paths, verbose: bool) -> Self {
         let (v4, v6, cf4, cf6) = tokio::join!(
             read_lines(&paths.blocked_v4),
@@ -173,20 +202,19 @@ impl Data {
             read_lines(&paths.cf_v4),
             read_lines(&paths.cf_v6)
         );
-        let data = Self {
-            blocked_v4: v4
-                .iter()
-                .filter_map(|s| Ipv4Addr::from_str(s).ok())
-                .map(u32::from)
-                .collect(),
-            blocked_v6: v6
-                .iter()
-                .filter_map(|s| Ipv6Addr::from_str(s).ok())
-                .map(u128::from)
-                .collect(),
-            cf_v4: merge_v4(cf4.iter().filter_map(|s| parse_v4_prefix(s))),
-            cf_v6: merge_v6(cf6.iter().filter_map(|s| parse_v6_prefix(s))),
-        };
+        let blocked_v4 = v4
+            .iter()
+            .filter_map(|s| Ipv4Addr::from_str(s).ok())
+            .map(u32::from)
+            .collect();
+        let blocked_v6 = v6
+            .iter()
+            .filter_map(|s| Ipv6Addr::from_str(s).ok())
+            .map(u128::from)
+            .collect();
+        let cf_v4 = merge_v4(cf4.iter().filter_map(|s| parse_v4_prefix(s)));
+        let cf_v6 = merge_v6(cf6.iter().filter_map(|s| parse_v6_prefix(s)));
+        let data = Self::new(blocked_v4, blocked_v6, cf_v4, cf_v6);
         if verbose {
             eprintln!(
                 "loaded {} blocked IPv4, {} blocked IPv6, {} Cloudflare IPv4 intervals, {} IPv6 intervals",
@@ -197,55 +225,60 @@ impl Data {
     }
 
     fn evasive_v4(&self, ip: u32) -> Option<u32> {
-        let (start, end) = containing(&self.cf_v4, ip)?;
-        let base = ip & 0xffff_ff00;
-        let last = (ip & 0xff) as i32;
-        for offset in 1..255i32 {
-            for candidate_last in [last + offset, last - offset] {
-                if (1..=254).contains(&candidate_last) {
-                    let candidate = base | candidate_last as u32;
-                    if candidate >= start
-                        && candidate <= end
-                        && !self.blocked_v4.contains(&candidate)
-                    {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-        let max = u64::from(end - start).saturating_add(1).min(65_536) as u32;
-        for offset in 1..max {
-            for candidate in [ip.checked_add(offset), ip.checked_sub(offset)]
-                .into_iter()
-                .flatten()
-            {
-                let last = candidate & 0xff;
-                if candidate >= start
-                    && candidate <= end
-                    && (1..=254).contains(&last)
-                    && !self.blocked_v4.contains(&candidate)
-                {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
+        self.evasion_v4.get(&ip).copied()
     }
 
     fn evasive_v6(&self, ip: u128) -> Option<u128> {
-        let (start, end) = containing(&self.cf_v6, ip)?;
-        for offset in 1..1024u128 {
-            for candidate in [ip.checked_add(offset), ip.checked_sub(offset)]
-                .into_iter()
-                .flatten()
-            {
-                if candidate >= start && candidate <= end && !self.blocked_v6.contains(&candidate) {
+        self.evasion_v6.get(&ip).copied()
+    }
+}
+
+fn scan_evasive_v4(ip: u32, cf_v4: &[(u32, u32)], blocked_v4: &HashSet<u32>) -> Option<u32> {
+    let (start, end) = containing(cf_v4, ip)?;
+    let base = ip & 0xffff_ff00;
+    let last = (ip & 0xff) as i32;
+    for offset in 1..255i32 {
+        for candidate_last in [last + offset, last - offset] {
+            if (1..=254).contains(&candidate_last) {
+                let candidate = base | candidate_last as u32;
+                if candidate >= start && candidate <= end && !blocked_v4.contains(&candidate) {
                     return Some(candidate);
                 }
             }
         }
-        None
     }
+    let max = u64::from(end - start).saturating_add(1).min(65_536) as u32;
+    for offset in 1..max {
+        for candidate in [ip.checked_add(offset), ip.checked_sub(offset)]
+            .into_iter()
+            .flatten()
+        {
+            let last = candidate & 0xff;
+            if candidate >= start
+                && candidate <= end
+                && (1..=254).contains(&last)
+                && !blocked_v4.contains(&candidate)
+            {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn scan_evasive_v6(ip: u128, cf_v6: &[(u128, u128)], blocked_v6: &HashSet<u128>) -> Option<u128> {
+    let (start, end) = containing(cf_v6, ip)?;
+    for offset in 1..1024u128 {
+        for candidate in [ip.checked_add(offset), ip.checked_sub(offset)]
+            .into_iter()
+            .flatten()
+        {
+            if candidate >= start && candidate <= end && !blocked_v6.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -955,14 +988,15 @@ mod tests {
             0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 1, b'a', 3, b'c', b'o', b'm', 0, 0, 1,
             0, 1, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 104, 16, 1, 1,
         ];
-        let data = Data {
-            blocked_v4: HashSet::from([u32::from(Ipv4Addr::new(104, 16, 1, 1))]),
-            cf_v4: vec![(
+        let data = Data::new(
+            HashSet::from([u32::from(Ipv4Addr::new(104, 16, 1, 1))]),
+            HashSet::new(),
+            vec![(
                 u32::from(Ipv4Addr::new(104, 16, 0, 0)),
                 u32::from(Ipv4Addr::new(104, 16, 255, 255)),
             )],
-            ..Default::default()
-        };
+            Vec::new(),
+        );
         let app = App {
             data: RwLock::new(Arc::new(data)),
             counters: Counters::default(),
@@ -988,14 +1022,15 @@ mod tests {
         ];
         let ttl_at = 29;
         let hint_at = packet.len() - 4;
-        let data = Data {
-            blocked_v4: HashSet::from([u32::from(Ipv4Addr::new(104, 16, 1, 1))]),
-            cf_v4: vec![(
+        let data = Data::new(
+            HashSet::from([u32::from(Ipv4Addr::new(104, 16, 1, 1))]),
+            HashSet::new(),
+            vec![(
                 u32::from(Ipv4Addr::new(104, 16, 0, 0)),
                 u32::from(Ipv4Addr::new(104, 16, 255, 255)),
             )],
-            ..Default::default()
-        };
+            Vec::new(),
+        );
         let app = App {
             data: RwLock::new(Arc::new(data)),
             counters: Counters::default(),
