@@ -106,9 +106,23 @@ jobs:
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
         run: |
+          set -euo pipefail
+          # One %s per digest. A two-%s printf with IMAGE_NAME + glob pairs
+          # leftovers into ghcr.io/<digest>@sha256: on the second platform.
+          shopt -s nullglob
+          sources=()
+          for digest in *; do
+            [ -f "$digest" ] || continue
+            sources+=("ghcr.io/${IMAGE_NAME}@sha256:${digest}")
+          done
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "no image digests in $(pwd)" >&2
+            ls -la >&2 || true
+            exit 1
+          fi
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/%s@sha256:%s ' "$IMAGE_NAME" *)
+            "${sources[@]}"
 
       - name: Inspect image
         run: docker buildx imagetools inspect ghcr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
