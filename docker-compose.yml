@@ -1,0 +1,51 @@
+# Example stack: evade-proxy + a DNSSEC-validating unbound resolver it sits
+# in front of + the blocklist/Cloudflare-prefix updater loop.
+#
+# unbound and blocklist-updater join evade-proxy's network namespace
+# (network_mode: "service:evade-proxy") because evade-proxy always dials
+# its upstream on 127.0.0.1 (see README "Puertos").
+#
+# To run this in front of a DNS server that already publishes host ports
+# 53/853/... (e.g. AdGuard Home in network_mode: host on the same box),
+# add `network_mode: host` to the evade-proxy service, drop its `ports:`
+# section, and point that server's upstream DNS at 127.0.0.1:5335.
+services:
+  evade-proxy:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - evade-proxy.env.example
+    ports:
+      - "5335:5335/udp"
+      - "5335:5335/tcp"
+      - "5339:5339/tcp"
+    volumes:
+      - unbound-conf:/etc/unbound
+      - evade-state:/var/lib/evade-proxy
+      - evade-run:/run/evade-proxy
+
+  unbound:
+    build:
+      context: .
+      dockerfile: docker/unbound.Dockerfile
+    restart: unless-stopped
+    network_mode: "service:evade-proxy"
+    depends_on:
+      - evade-proxy
+
+  blocklist-updater:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["/opt/xdp-dns-evadeproxy/scripts/docker-update-loop.sh"]
+    env_file:
+      - evade-proxy.env.example
+    network_mode: "service:evade-proxy"
+    volumes:
+      - unbound-conf:/etc/unbound
+    depends_on:
+      - evade-proxy
+
+volumes:
+  unbound-conf:
+  evade-state:
+  evade-run:
