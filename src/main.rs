@@ -116,6 +116,12 @@ fn normalize_domain(domain: &str) -> Result<String> {
     Ok(normalized)
 }
 
+/// TTL por defecto de las respuestas reescritas. Las listas se recargan cada
+/// 5 s, así que 30 s acota el tiempo que un cliente puede seguir usando una IP
+/// sustituta que haya pasado a estar bloqueada, y evita que cada conexión a un
+/// dominio evadido vuelva a consultar al servidor (antes TTL=0).
+const DEFAULT_REWRITE_TTL: u32 = 30;
+
 #[derive(Clone, Debug)]
 struct Paths {
     blocked_v4: PathBuf,
@@ -124,6 +130,9 @@ struct Paths {
     cf_v6: PathBuf,
     stats: PathBuf,
     redirects: PathBuf,
+    /// TTL (segundos) que se escribe en los RR de una respuesta reescrita.
+    /// 0 reproduce el comportamiento antiguo (sin caché en el cliente).
+    rewrite_ttl: u32,
 }
 
 impl Paths {
@@ -153,6 +162,10 @@ impl Paths {
                 },
             ),
             redirects: value("EVADE_REDIRECTS_FILE", "/run/evade-proxy/redirects.txt"),
+            rewrite_ttl: std::env::var("EVADE_REWRITE_TTL")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(DEFAULT_REWRITE_TTL),
         }
     }
 }
@@ -429,8 +442,9 @@ impl App {
         if changes.is_empty() {
             return 0;
         }
+        let ttl = self.paths.rewrite_ttl.to_be_bytes();
         for rr in records {
-            packet[rr.ttl..rr.ttl + 4].fill(0);
+            packet[rr.ttl..rr.ttl + 4].copy_from_slice(&ttl);
         }
         for (offset, bytes) in &changes {
             packet[*offset..*offset + bytes.len()].copy_from_slice(bytes);
@@ -989,7 +1003,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrites_a_in_place_and_zeros_ttl() {
+    fn rewrites_a_in_place_and_sets_ttl() {
         let mut packet = vec![
             0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 1, b'a', 3, b'c', b'o', b'm', 0, 0, 1,
             0, 1, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 104, 16, 1, 1,
@@ -1012,11 +1026,14 @@ mod tests {
         };
         assert_eq!(app.rewrite(&mut packet), 1);
         assert_eq!(&packet[packet.len() - 4..], &[104, 16, 1, 2]);
-        assert_eq!(&packet[packet.len() - 10..packet.len() - 6], &[0, 0, 0, 0]);
+        assert_eq!(
+            &packet[packet.len() - 10..packet.len() - 6],
+            &DEFAULT_REWRITE_TTL.to_be_bytes()
+        );
     }
 
     #[test]
-    fn rewrites_https_ipv4hint_and_zeros_ttl() {
+    fn rewrites_https_ipv4hint_and_sets_ttl() {
         // HTTPS (type 65) answer for a.com carrying ipv4hint=104.16.1.1.
         // RDATA: priority(0001) target(00) key4(0004) len(0004) hint(104.16.1.1)
         let mut packet = vec![
@@ -1046,7 +1063,10 @@ mod tests {
         };
         assert_eq!(app.rewrite(&mut packet), 1);
         assert_eq!(&packet[hint_at..hint_at + 4], &[104, 16, 1, 2]);
-        assert_eq!(&packet[ttl_at..ttl_at + 4], &[0, 0, 0, 0]);
+        assert_eq!(
+            &packet[ttl_at..ttl_at + 4],
+            &DEFAULT_REWRITE_TTL.to_be_bytes()
+        );
     }
 
     #[test]

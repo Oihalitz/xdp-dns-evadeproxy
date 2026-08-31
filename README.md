@@ -74,7 +74,7 @@ cliente → Blocky / DoH / DoT → evade-proxy :5335 → Unbound :5336
 ```
 
 1. Unbound responde con la IP real (DNSSEC).
-2. Si un A, AAAA o hint HTTPS/SVCB está en la blocklist **y** en un prefijo Cloudflare, el proxy la cambia por un vecino del mismo prefijo que no esté listado, y pone TTL 0.
+2. Si un A, AAAA o hint HTTPS/SVCB está en la blocklist **y** en un prefijo Cloudflare, el proxy la cambia por un vecino del mismo prefijo que no esté listado, y pone TTL 30 s (`EVADE_REWRITE_TTL`; `0` restaura el comportamiento anterior, sin caché en el cliente).
 3. Fuera de Cloudflare no se toca nada. En CDNs no-anycast la sonda fija un `redirect` a una IP **verificada** desde casa y desde el servidor.
 
 La reescritura es in-place: punteros de compresión, flags y orden de registros se conservan.
@@ -184,7 +184,7 @@ Solo conexiones salientes (funciona detrás del NAT). Detalle: [`probe/README.md
 | `127.0.0.1:5339` HTTP | — | `/metrics` y stats JSON |
 | `127.0.0.1:8090` HTTP | — | ingest de la sonda |
 
-Variables: [`evade-proxy.env.example`](evade-proxy.env.example). Redirects temporales de producción (`/run/evade-proxy/redirects.txt`):
+Variables: [`evade-proxy.env.example`](evade-proxy.env.example) (`EVADE_REWRITE_TTL` incluido). Redirects temporales de producción (`/run/evade-proxy/redirects.txt`):
 
 ```
 ejemplo.es=104.18.13.102 1787609000
