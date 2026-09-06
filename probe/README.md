@@ -31,11 +31,12 @@ falsos positivos.
   `probe_blocked_ipv6.txt` / `probe_blocked_ips.txt`. `update-blocked-ips.sh`
   las une a `blocked_ipv6.txt` / `blocked_ips.txt` y evade-proxy salta al
   vecino del prefijo (seguro en Cloudflare).
-- **verified-pool** (CDN no anycast — GitHub, Fastly, Akamai): no se puede
-  saltar a ciegas (una IP vecina puede estar muerta o servir otro sitio). Se
-  fija un `redirect` a una IP del pool **verificada sirviendo** desde casa y
-  desde el servidor (SNI + cert válido) en `/run/evade-proxy/redirects.txt`.
-  Si ninguna candidata sirve, no se toca nada.
+- **verified-pool** (CDN no anycast — GitHub, Fastly, CloudFront, Akamai;
+  Twitch web+CDN y Redsys TPV): no se puede saltar a ciegas (una IP vecina
+  puede estar muerta o servir otro sitio). Se fija un `redirect` a una IP del
+  pool **verificada sirviendo** desde casa y desde el servidor (SNI + cert
+  válido) en `/run/evade-proxy/redirects.txt`. Si ninguna candidata sirve, no
+  se toca nada.
 
 ## `domains.json`
 
