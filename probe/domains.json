@@ -1,9 +1,10 @@
 {
-  "comment": "Dominios monitorizados por la sonda residencial (Movistar). families: familias IP a sondear. strategy: cf-blocklist = CDN anycast Cloudflare, se alimenta blocked_ipv6/ips y el evade-proxy salta al vecino del prefijo; verified-pool = CDN no-anycast (GitHub/Fastly), se fija un redirect a una IP sana verificada.",
+  "comment": "Dominios monitorizados por la sonda residencial (Movistar). resolve=false + candidates_file: lista fija de IPs (relativa a este fichero) sin resolver DNS; bulk=true: solo para agentes que sondean en paralelo (X-Probe-Version >= 2). families: familias IP a sondear. strategy: cf-blocklist = CDN anycast Cloudflare, se alimenta blocked_ipv6/ips y el evade-proxy salta al vecino del prefijo; verified-pool = CDN no-anycast (GitHub/Fastly), se fija un redirect a una IP sana verificada.",
   "domains": [
     { "domain": "github.com",                 "sni": "github.com",                 "families": [4], "strategy": "verified-pool", "extra_candidates": ["140.82.112.3","140.82.113.3","140.82.113.4","140.82.114.3","140.82.116.3","140.82.121.3","140.82.121.4"] },
     { "domain": "gist.github.com",             "sni": "gist.github.com",            "families": [4], "strategy": "verified-pool", "extra_candidates": ["140.82.112.3","140.82.113.3","140.82.113.4","140.82.114.3","140.82.116.3","140.82.121.3","140.82.121.4"] },
     { "domain": "gist.githubusercontent.com",  "sni": "gist.githubusercontent.com", "families": [4], "strategy": "verified-pool" },
+    { "domain": "ooni-ipv6",                  "sni": "www.cloudflare.com",         "families": [6], "strategy": "cf-blocklist", "resolve": false, "candidates_file": "ooni-ipv6.txt", "bulk": true },
     { "domain": "sc.ohz.ovh",                  "sni": "sc.ohz.ovh",                 "families": [6], "strategy": "cf-blocklist" },
     { "domain": "turgame.com",                 "sni": "turgame.com",                "families": [6], "strategy": "cf-blocklist" },
     { "domain": "descargasdd.org",             "sni": "descargasdd.org",            "families": [6], "strategy": "cf-blocklist" },

@@ -231,19 +231,43 @@ def build_targets():
     out = []
     for d in load_config():
         for fam in d.get("families", [4]):
-            cand = resolve(d["domain"], fam)
+            # resolve=false: el "dominio" es solo una etiqueta para una lista fija.
+            cand = resolve(d["domain"], fam) if d.get("resolve", True) else []
             # Semillas fijas (pool de failover para dominios con una sola IP en DNS).
-            for ip in d.get("extra_candidates", []):
-                if ((":" in ip) == (fam == 6)) and ip not in cand:
+            seeds = list(d.get("extra_candidates", []))
+            if d.get("candidates_file"):
+                seeds += read_candidates(d["candidates_file"])
+            for ip in seeds:
+                if valid_ip(ip, fam) and ip not in cand:
                     cand.append(ip)
             out.append({
                 "domain": d["domain"], "sni": d.get("sni", d["domain"]),
                 "family": fam, "strategy": d.get("strategy", "cf-blocklist"),
-                "candidates": cand,
+                "candidates": cand, "bulk": bool(d.get("bulk")),
             })
     payload = {"targets": out, "interval": 30}
     _targets_cache.update(ts=now, data=payload)
     return payload
+
+
+def read_candidates(name):
+    """Lista de IPs, una por línea, relativa al directorio de domains.json."""
+    path = os.path.join(os.path.dirname(os.path.abspath(CONFIG)), name)
+    try:
+        with open(path) as fh:
+            return [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+    except Exception as exc:
+        print(f"[probe-server] no pude leer {path}: {exc}", flush=True)
+        return []
+
+
+def targets_for(agent_version):
+    """Los objetivos bulk (listas largas de IPs) solo van a agentes que sondean
+    en paralelo; uno secuencial tardaría minutos por ronda con IPs cortadas."""
+    payload = build_targets()
+    if agent_version >= 2:
+        return payload
+    return {**payload, "targets": [t for t in payload["targets"] if not t.get("bulk")]}
 
 
 def strategy_of(domain, family):
@@ -384,7 +408,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             return self._send(401, {"error": "unauthorized"})
         if path.endswith("/targets"):
-            return self._send(200, build_targets())
+            try:
+                version = int(self.headers.get("X-Probe-Version", "1"))
+            except ValueError:
+                version = 1
+            return self._send(200, targets_for(version))
         if path.endswith("/status"):
             now = time.time()
             with _lock:

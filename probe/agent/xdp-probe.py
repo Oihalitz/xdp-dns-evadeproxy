@@ -10,6 +10,7 @@ Config por variables de entorno (o /etc/xdp-probe.env):
   XDP_PROBE_TOKEN  token compartido (bearer)
   XDP_PROBE_ID     identificador libre de esta sonda (def: hostname)
   XDP_PROBE_INTERVAL  segundos entre rondas (def: el que diga el servidor, o 30)
+  XDP_PROBE_WORKERS   sondeos simultáneos (def: 16)
 Sin dependencias externas: solo la stdlib de Python 3."""
 
 import json
@@ -18,12 +19,16 @@ import socket
 import ssl
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 URL = os.environ.get("XDP_PROBE_URL", "").rstrip("/")
 TOKEN = os.environ.get("XDP_PROBE_TOKEN", "")
 PROBE_ID = os.environ.get("XDP_PROBE_ID") or socket.gethostname()
 FIXED_INTERVAL = os.environ.get("XDP_PROBE_INTERVAL")
 TIMEOUT = 6.0
+WORKERS = int(os.environ.get("XDP_PROBE_WORKERS") or 16)
+# 2 = sondea en paralelo: el servidor le manda también listas largas de IPs.
+AGENT_VERSION = "2"
 
 
 def probe_ip(ip, sni, family, timeout=TIMEOUT):
@@ -60,6 +65,7 @@ def http_json(method, path, payload=None):
             "Authorization": f"Bearer {TOKEN}",
             "Content-Type": "application/json",
             "User-Agent": "xdp-probe-agent",
+            "X-Probe-Version": AGENT_VERSION,
         },
     )
     with urllib.request.urlopen(req, timeout=20) as r:
@@ -81,7 +87,7 @@ def run_once():
     tg = http_json("GET", "/targets")
     targets = tg.get("targets", [])
     v6ok = have_ipv6()
-    results = []
+    jobs = []
     skipped6 = 0
     for t in targets:
         fam = int(t.get("family", 4))
@@ -90,11 +96,15 @@ def run_once():
             continue
         sni = t.get("sni", t["domain"])
         for ip in t.get("candidates", []):
-            serving, rtt = probe_ip(ip, sni, fam)
-            results.append({
-                "domain": t["domain"], "family": fam, "ip": ip,
-                "serving": serving, "rtt_ms": rtt,
-            })
+            jobs.append((t["domain"], fam, ip, sni))
+    # En paralelo: una IP cortada agota el timeout (6 s) y con listas largas
+    # una ronda secuencial se iría a minutos.
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        probes = list(pool.map(lambda j: probe_ip(j[2], j[3], j[1]), jobs))
+    results = [
+        {"domain": d, "family": fam, "ip": ip, "serving": serving, "rtt_ms": rtt}
+        for (d, fam, ip, _), (serving, rtt) in zip(jobs, probes)
+    ]
     resp = http_json("POST", "/report", {"probe_id": PROBE_ID, "results": results})
     conf = resp.get("confirmed_blocked", [])
     reds = resp.get("active_redirects", {})

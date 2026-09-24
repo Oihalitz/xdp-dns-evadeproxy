@@ -154,7 +154,7 @@ servidor a `127.0.0.1:5335`.
 2. Se queda solo con direcciones IPv4
 3. Une las IPs que confirmó la sonda
 4. Escribe `/etc/unbound/blocked_ips.txt` — evade-proxy lo recarga cada 5 s
-5. Une IPv6 de la sonda en `/etc/unbound/blocked_ipv6.txt`
+5. Une IPv6 de la sonda en `/etc/unbound/blocked_ipv6.txt`. `EVADE_OONI_IPV6_FILE` permite añadir una lista estática, pero esas IPs no se verifican nunca. Es mejor dejar que las compruebe la sonda (`probe/ooni-ipv6.txt`).
 6. Actualiza los rangos de Cloudflare (una vez al día): los oficiales (`cloudflare.com/ips-v4`, `ips-v6`), únicos donde se reescribe, y todo AS13335 como referencia. AS13335 incluye `1.1.1.0/24` y prefijos BYOIP de clientes, donde la IP vecina es otro servicio.
 
 No hace falta vaciar la caché del resolver: el proxy reescribe a la salida, también las respuestas ya cacheadas.
@@ -166,7 +166,7 @@ Cubre **IPv6** y CDNs no-anycast. Pide objetivos, sondea `TCP:443` + TLS(SNI) + 
 En `probe/domains.json`:
 
 - `cf-blocklist` — Cloudflare. La IP entra en la blocklist; el proxy salta al vecino.
-- `verified-pool` — GitHub / Fastly / Akamai. Se fija `dominio=IP_sana` en `redirects.txt`.
+- `verified-pool` — GitHub / Fastly / Akamai. Se fija `dominio=IP_sana` en `redirects.txt`. Mientras el redirect fija solo IPv4, las consultas AAAA y HTTPS de ese dominio reciben una respuesta vacía, para que un cliente con IPv6 no se salte la IP verificada.
 
 En casa (Raspberry Pi / mini-PC):
 

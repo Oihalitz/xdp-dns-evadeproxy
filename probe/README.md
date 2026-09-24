@@ -48,6 +48,20 @@ falsos positivos.
 
 `extra_candidates` da un pool de failover a dominios con una sola IP en DNS.
 
+Para verificar una lista fija de IPs en lugar de un dominio:
+
+```json
+{ "domain": "ooni-ipv6", "sni": "www.cloudflare.com", "families": [6],
+  "strategy": "cf-blocklist", "resolve": false,
+  "candidates_file": "ooni-ipv6.txt", "bulk": true }
+```
+
+- `resolve: false`: el dominio es solo una etiqueta; no se resuelve.
+- `candidates_file`: una IP por línea, con ruta relativa a `domains.json`.
+- `bulk: true`: solo se envía a agentes que sondean en paralelo (versión 2 o posterior). Uno antiguo, secuencial, tardaría minutos por ronda.
+
+`ooni-ipv6.txt` contiene las IPv6 de Cloudflare que OONI vio bloqueadas en España. En lugar de meterlas a ciegas en la blocklist, la sonda las comprueba cada ronda: solo entran las que siguen cortadas desde casa y funcionan desde el servidor.
+
 ## Servidor
 
 ```sh
@@ -77,6 +91,13 @@ Instala `/opt/xdp-probe/xdp-probe.py`, escribe `/etc/xdp-probe.env` (chmod 600)
 y arranca `xdp-probe.service`. Requisitos: `python3` (stdlib) y salida a
 Internet IPv4+IPv6. La sonda solo hace conexiones **salientes** (funciona
 tras el NAT del router). Logs: `journalctl -u xdp-probe -f`.
+
+Para actualizar un agente ya instalado:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Oihalitz/xdp-dns-evadeproxy/main/probe/agent/xdp-probe.py -o /opt/xdp-probe/xdp-probe.py
+systemctl restart xdp-probe
+```
 
 ## Parámetros (`probe-server.py`)
 
