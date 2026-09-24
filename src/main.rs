@@ -444,6 +444,82 @@ impl App {
         })
     }
 
+    fn active_redirect<'a>(
+        &'a self,
+        packet: &[u8],
+        temporary_redirects: &'a HashMap<String, TestRedirect>,
+    ) -> Option<&'a TestRedirect> {
+        // Decoding the question name allocates (labels, lowercasing, join). Only pay
+        // for it when some redirect rule actually exists — in production neither map
+        // is populated most of the time, so this is skipped on the common path.
+        if self.test_redirects.is_empty() && temporary_redirects.is_empty() {
+            return None;
+        }
+        question_name(packet)
+            .and_then(|domain| {
+                self.test_redirects
+                    .get(&domain)
+                    .or_else(|| temporary_redirects.get(&domain))
+            })
+            .filter(|redirect| redirect.expires_at.is_none_or(|expires| expires > epoch()))
+    }
+
+    /// Entry point for upstream responses: may shrink the packet (see
+    /// `suppress_unverified_family`), otherwise rewrites it in place.
+    fn process(&self, packet: &mut Vec<u8>) -> usize {
+        if let Some(removed) = self.suppress_unverified_family(packet) {
+            return removed;
+        }
+        self.rewrite(packet)
+    }
+
+    /// While a redirect pins only an IPv4 address, answer AAAA and HTTPS/SVCB
+    /// with an empty NOERROR. Otherwise a dual-stack client would take the
+    /// untested (possibly blocked) IPv6 path and skip the verified IPv4 one:
+    /// AAAA directly, HTTPS through its ipv6hint, which cannot be removed in
+    /// place. Without HTTPS the browser falls back to the redirected A record.
+    /// There is no SOA, so resolvers do not cache the empty answer.
+    fn suppress_unverified_family(&self, packet: &mut Vec<u8>) -> Option<usize> {
+        let temporary_redirects = self
+            .temporary_redirects
+            .read()
+            .expect("redirect lock poisoned")
+            .clone();
+        let redirect = self.active_redirect(packet, &temporary_redirects)?;
+        if redirect.v4.is_none() || redirect.v6.is_some() {
+            return None;
+        }
+        let question_end = skip_name(packet, 12)?.checked_add(4)?;
+        let qtype = be16(packet, question_end - 4)?;
+        let rcode = packet.get(3)? & 0x0f;
+        let answers = be16(packet, 6)? as usize;
+        if !matches!(qtype, 28 | 64 | 65) || rcode != 0 || answers == 0 {
+            return None;
+        }
+        let records = resource_records(packet)?;
+        let mut out = packet.get(..question_end)?.to_vec();
+        // Keep the EDNS OPT pseudo-record (root name, no compression pointers).
+        let mut additional = 0u16;
+        for rr in records.iter().filter(|rr| rr.kind == 41) {
+            out.extend_from_slice(&packet[rr.start..rr.rdata + rr.rdlen]);
+            additional += 1;
+        }
+        out[6..8].copy_from_slice(&0u16.to_be_bytes());
+        out[8..10].copy_from_slice(&0u16.to_be_bytes());
+        out[10..12].copy_from_slice(&additional.to_be_bytes());
+        out[3] &= !0x20; // not validated data any more
+        *packet = out;
+        self.counters.total_queries.fetch_add(1, Relaxed);
+        self.counters.evaded_queries.fetch_add(1, Relaxed);
+        self.counters
+            .evaded_records
+            .fetch_add(answers as u64, Relaxed);
+        self.counters
+            .last_evaded_bits
+            .store(epoch().to_bits(), Relaxed);
+        Some(answers)
+    }
+
     fn rewrite(&self, packet: &mut [u8]) -> usize {
         self.counters.total_queries.fetch_add(1, Relaxed);
         let data = self.data.read().expect("data lock poisoned").clone();
@@ -452,21 +528,7 @@ impl App {
             .read()
             .expect("redirect lock poisoned")
             .clone();
-        // Decoding the question name allocates (labels, lowercasing, join). Only pay
-        // for it when some redirect rule actually exists — in production neither map
-        // is populated most of the time, so this is skipped on the common path.
-        let has_redirects = !self.test_redirects.is_empty() || !temporary_redirects.is_empty();
-        let test_redirect = if has_redirects {
-            question_name(packet)
-                .and_then(|domain| {
-                    self.test_redirects
-                        .get(&domain)
-                        .or_else(|| temporary_redirects.get(&domain))
-                })
-                .filter(|redirect| redirect.expires_at.is_none_or(|expires| expires > epoch()))
-        } else {
-            None
-        };
+        let test_redirect = self.active_redirect(packet, &temporary_redirects);
         let records = match resource_records(packet) {
             Some(records) => records,
             None => return 0,
@@ -583,6 +645,7 @@ impl App {
 
 #[derive(Clone, Copy)]
 struct Record {
+    start: usize,
     kind: u16,
     ttl: usize,
     rdlen: usize,
@@ -607,6 +670,7 @@ fn resource_records(packet: &[u8]) -> Option<Vec<Record>> {
     }
     let mut records = Vec::with_capacity(total);
     for index in 0..total {
+        let start = pos;
         pos = skip_name(packet, pos)?;
         if pos.checked_add(10)? > packet.len() {
             return None;
@@ -620,6 +684,7 @@ fn resource_records(packet: &[u8]) -> Option<Vec<Record>> {
             return None;
         }
         records.push(Record {
+            start,
             kind,
             ttl,
             rdlen,
@@ -820,7 +885,7 @@ async fn serve_udp(app: Arc<App>, socket: Arc<UdpSocket>, upstream: SocketAddr) 
             let _slot = slot;
             match forward_udp(&query, upstream).await {
                 Some(mut response) => {
-                    app.rewrite(&mut response);
+                    app.process(&mut response);
                     let _ = socket.send_to(&response, peer).await;
                 }
                 None => {
@@ -899,7 +964,7 @@ async fn handle_tcp(app: Arc<App>, mut client: TcpStream, upstream: SocketAddr) 
                 return Err(err);
             }
         };
-        app.rewrite(&mut response);
+        app.process(&mut response);
         client.write_all(&tcp_frame(&response)).await?;
     }
 }
@@ -1827,6 +1892,89 @@ mod tests {
         let third = Data::load(&paths, Some(&second)).await;
         assert!(third.blocked_v4.is_empty()); // an empty file is a real update
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn redirect_app(rule: &str) -> App {
+        let mut rules = HashMap::new();
+        add_redirect(&mut rules, rule).unwrap();
+        App {
+            data: RwLock::new(Arc::new(Data::default())),
+            counters: Counters::default(),
+            paths: Paths::from_env(true),
+            test_redirects: rules,
+            temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+            limits: Limits::default(),
+        }
+    }
+
+    // answer_packet plus an EDNS OPT record with the DO bit.
+    fn with_opt(mut packet: Vec<u8>) -> Vec<u8> {
+        packet[11] = 1;
+        packet.extend([0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0]);
+        packet
+    }
+
+    #[test]
+    fn v4_only_redirect_empties_aaaa_and_https_but_keeps_opt() {
+        let app = redirect_app("a.com=203.0.113.7");
+        let v6 = "2606:4700::1".parse::<Ipv6Addr>().unwrap().octets();
+        let https = [0, 1, 0, 0, 6, 0, 16]
+            .iter()
+            .copied()
+            .chain(v6)
+            .collect::<Vec<_>>();
+        for (kind, rdata) in [(28u16, v6.to_vec()), (65, https)] {
+            let original = with_opt(answer_packet(kind, 300, &rdata));
+            let mut packet = original.clone();
+            assert_eq!(app.process(&mut packet), 1);
+            let question_end = skip_name(&packet, 12).unwrap() + 4;
+            assert_eq!(&packet[..2], &original[..2]); // same ID
+            assert_eq!(be16(&packet, 6), Some(0)); // no answers
+            assert_eq!(be16(&packet, 10), Some(1)); // OPT kept
+            assert_eq!(packet[3] & 0x20, 0); // AD cleared
+            assert_eq!(
+                &packet[question_end..],
+                &[0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn v4_only_redirect_still_rewrites_a() {
+        let app = redirect_app("a.com=203.0.113.7");
+        let mut packet = with_opt(answer_packet(1, 300, &[104, 16, 1, 1]));
+        assert_eq!(app.process(&mut packet), 1);
+        assert_eq!(be16(&packet, 6), Some(1));
+        let rr = resource_records(&packet).unwrap()[0];
+        assert_eq!(&packet[rr.rdata..rr.rdata + 4], &[203, 0, 113, 7]);
+    }
+
+    #[test]
+    fn aaaa_is_kept_without_redirect_or_with_an_ipv6_redirect() {
+        let v6 = "2606:4700::1".parse::<Ipv6Addr>().unwrap().octets();
+        let plain = App {
+            test_redirects: HashMap::new(),
+            ..redirect_app("a.com=203.0.113.7")
+        };
+        let mut packet = with_opt(answer_packet(28, 300, &v6));
+        plain.process(&mut packet);
+        assert_eq!(be16(&packet, 6), Some(1));
+
+        let dual = redirect_app("a.com=203.0.113.7");
+        let mut rules = dual.test_redirects.clone();
+        add_redirect(&mut rules, "a.com=2001:db8::7").unwrap();
+        let dual = App {
+            test_redirects: rules,
+            ..dual
+        };
+        let mut packet = with_opt(answer_packet(28, 300, &v6));
+        assert_eq!(dual.process(&mut packet), 1);
+        assert_eq!(be16(&packet, 6), Some(1));
+        let rr = resource_records(&packet).unwrap()[0];
+        assert_eq!(
+            &packet[rr.rdata..rr.rdata + 16],
+            &"2001:db8::7".parse::<Ipv6Addr>().unwrap().octets()
+        );
     }
 
     #[test]
