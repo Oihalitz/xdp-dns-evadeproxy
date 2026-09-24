@@ -187,7 +187,9 @@ Solo conexiones salientes (funciona detrás del NAT). Detalle: [`probe/README.md
 | `127.0.0.1:5339` HTTP | — | `/metrics` y stats JSON |
 | `127.0.0.1:8090` HTTP | — | ingest de la sonda |
 
-Variables: [`evade-proxy.env.example`](evade-proxy.env.example) (`EVADE_REWRITE_TTL` incluido). Redirects temporales de producción (`/run/evade-proxy/redirects.txt`):
+Variables: [`evade-proxy.env.example`](evade-proxy.env.example) (`EVADE_REWRITE_TTL` incluido).
+
+Como mucho `EVADE_MAX_INFLIGHT_UDP` (4096) consultas UDP y `EVADE_MAX_INFLIGHT_TCP` (1024) conexiones TCP esperan a Unbound a la vez. Por encima se descartan, en lugar de dejar crecer la memoria durante un flood, y el cliente reintenta. `/metrics` expone `xdp_evade_inflight` y `xdp_evade_dropped_total` por protocolo. Redirects temporales de producción (`/run/evade-proxy/redirects.txt`):
 
 ```
 ejemplo.es=104.18.13.102 1787609000

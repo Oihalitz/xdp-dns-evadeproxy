@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, Ipv6Addr},
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -14,6 +16,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::Semaphore,
     time::timeout,
 };
 
@@ -24,6 +27,11 @@ const TEST_PORT_PAIRS: &[(u16, u16)] = &[(15335, 5336), (15337, 5338)];
 const PRODUCTION_METRICS_PORT: u16 = 5339;
 const TEST_METRICS_PORT: u16 = 15339;
 const UDP_LIMIT: usize = 65_535;
+/// Queries allowed to wait on Unbound at once, shared by both port pairs.
+/// Beyond this the proxy drops new queries instead of growing without bound
+/// during a flood; clients retry. Overridable with EVADE_MAX_INFLIGHT_UDP/TCP.
+const DEFAULT_MAX_INFLIGHT_UDP: usize = 4096;
+const DEFAULT_MAX_INFLIGHT_TCP: usize = 1024;
 
 #[derive(Clone, Default, PartialEq)]
 struct TestRedirect {
@@ -303,6 +311,8 @@ struct Counters {
     evaded_records: AtomicU64,
     total_queries: AtomicU64,
     last_evaded_bits: AtomicU64,
+    dropped_udp: AtomicU64,
+    dropped_tcp: AtomicU64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -326,6 +336,7 @@ impl Counters {
             evaded_records: AtomicU64::new(parsed.evaded_records_total),
             total_queries: AtomicU64::new(parsed.total_queries_processed),
             last_evaded_bits: AtomicU64::new(parsed.last_evasion_timestamp.to_bits()),
+            ..Default::default()
         }
     }
 
@@ -340,12 +351,59 @@ impl Counters {
     }
 }
 
+struct Limits {
+    udp: Arc<Semaphore>,
+    tcp: Arc<Semaphore>,
+    max_udp: usize,
+    max_tcp: usize,
+}
+
+impl Limits {
+    fn new(max_udp: usize, max_tcp: usize) -> Self {
+        Self {
+            udp: Arc::new(Semaphore::new(max_udp)),
+            tcp: Arc::new(Semaphore::new(max_tcp)),
+            max_udp,
+            max_tcp,
+        }
+    }
+
+    fn from_env() -> Self {
+        fn value(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(default)
+        }
+        Self::new(
+            value("EVADE_MAX_INFLIGHT_UDP", DEFAULT_MAX_INFLIGHT_UDP),
+            value("EVADE_MAX_INFLIGHT_TCP", DEFAULT_MAX_INFLIGHT_TCP),
+        )
+    }
+
+    fn inflight_udp(&self) -> usize {
+        self.max_udp - self.udp.available_permits()
+    }
+
+    fn inflight_tcp(&self) -> usize {
+        self.max_tcp - self.tcp.available_permits()
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_INFLIGHT_UDP, DEFAULT_MAX_INFLIGHT_TCP)
+    }
+}
+
 struct App {
     data: RwLock<Arc<Data>>,
     counters: Counters,
     paths: Paths,
     test_redirects: HashMap<String, TestRedirect>,
     temporary_redirects: RwLock<Arc<HashMap<String, TestRedirect>>>,
+    limits: Limits,
 }
 
 impl App {
@@ -359,6 +417,7 @@ impl App {
             paths,
             test_redirects,
             temporary_redirects: RwLock::new(Arc::new(temporary_redirects)),
+            limits: Limits::from_env(),
         })
     }
 
@@ -711,30 +770,60 @@ fn be16(bytes: &[u8], pos: usize) -> Option<u16> {
 
 async fn udp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind((LISTEN_HOST, listen)).await?);
-    eprintln!("DNS UDP {LISTEN_HOST}:{listen} -> {UPSTREAM_HOST}:{upstream}");
+    let upstream: SocketAddr = format!("{UPSTREAM_HOST}:{upstream}").parse()?;
+    eprintln!("DNS UDP {LISTEN_HOST}:{listen} -> {upstream}");
+    serve_udp(app, socket, upstream).await
+}
+
+async fn serve_udp(app: Arc<App>, socket: Arc<UdpSocket>, upstream: SocketAddr) -> Result<()> {
+    // One receive buffer for the listener; each query is copied out at its real
+    // size, so a query waiting on Unbound no longer pins 64 KiB.
+    let mut buffer = vec![0u8; UDP_LIMIT];
     loop {
-        let mut buffer = vec![0u8; UDP_LIMIT];
         let (len, peer) = socket.recv_from(&mut buffer).await?;
-        buffer.truncate(len);
+        let Ok(slot) = app.limits.udp.clone().try_acquire_owned() else {
+            app.counters.dropped_udp.fetch_add(1, Relaxed);
+            continue;
+        };
+        let query = buffer[..len].to_vec();
         let app = app.clone();
         let socket = socket.clone();
         tokio::spawn(async move {
-            if let Ok(Ok(up)) =
-                timeout(Duration::from_secs(3), UdpSocket::bind((LISTEN_HOST, 0))).await
-            {
-                if up.connect((UPSTREAM_HOST, upstream)).await.is_ok()
-                    && up.send(&buffer).await.is_ok()
-                {
-                    buffer.resize(UDP_LIMIT, 0);
-                    if let Ok(Ok(len)) = timeout(Duration::from_secs(3), up.recv(&mut buffer)).await
-                    {
-                        app.rewrite(&mut buffer[..len]);
-                        let _ = socket.send_to(&buffer[..len], peer).await;
-                    }
-                }
+            let _slot = slot;
+            if let Some(mut response) = forward_udp(&query, upstream).await {
+                app.rewrite(&mut response);
+                let _ = socket.send_to(&response, peer).await;
             }
         });
     }
+}
+
+async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+    let up = UdpSocket::bind((LISTEN_HOST, 0)).await.ok()?;
+    up.connect(upstream).await.ok()?;
+    up.send(query).await.ok()?;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            up.readable().await.ok()?;
+            match recv_exact(&up) {
+                Ok(response) => return Some(response),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .ok()?
+}
+
+/// Reads one datagram through a per-thread 64 KiB scratch buffer and returns
+/// only the bytes received. Synchronous on purpose: the scratch buffer never
+/// becomes part of a suspended task.
+fn recv_exact(socket: &UdpSocket) -> io::Result<Vec<u8>> {
+    thread_local! {
+        static SCRATCH: RefCell<Box<[u8]>> = RefCell::new(vec![0; UDP_LIMIT].into_boxed_slice());
+    }
+    SCRATCH.with_borrow_mut(|scratch| socket.try_recv(scratch).map(|len| scratch[..len].to_vec()))
 }
 
 async fn tcp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
@@ -742,8 +831,13 @@ async fn tcp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
     eprintln!("DNS TCP {LISTEN_HOST}:{listen} -> {UPSTREAM_HOST}:{upstream}");
     loop {
         let (client, _) = listener.accept().await?;
+        let Ok(slot) = app.limits.tcp.clone().try_acquire_owned() else {
+            app.counters.dropped_tcp.fetch_add(1, Relaxed);
+            continue; // dropping `client` closes the connection
+        };
         let app = app.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             let _ = handle_tcp(app, client, upstream).await;
         });
     }
@@ -802,8 +896,10 @@ async fn handle_http(app: Arc<App>, stream: TcpStream) -> Result<()> {
     let stats = app.counters.snapshot();
     let (kind, body) = if metrics {
         ("text/plain; version=0.0.4", format!(
-            "# HELP xdp_evade_queries_total Total DNS queries rewritten for block evasion\n# TYPE xdp_evade_queries_total counter\nxdp_evade_queries_total {}\n# HELP xdp_evade_records_total Total DNS records replaced for block evasion\n# TYPE xdp_evade_records_total counter\nxdp_evade_records_total {}\n# HELP xdp_evade_queries_processed Total queries processed by evasion proxy\n# TYPE xdp_evade_queries_processed counter\nxdp_evade_queries_processed {}\n",
-            stats.evaded_queries_total, stats.evaded_records_total, stats.total_queries_processed))
+            "# HELP xdp_evade_queries_total Total DNS queries rewritten for block evasion\n# TYPE xdp_evade_queries_total counter\nxdp_evade_queries_total {}\n# HELP xdp_evade_records_total Total DNS records replaced for block evasion\n# TYPE xdp_evade_records_total counter\nxdp_evade_records_total {}\n# HELP xdp_evade_queries_processed Total queries processed by evasion proxy\n# TYPE xdp_evade_queries_processed counter\nxdp_evade_queries_processed {}\n# HELP xdp_evade_dropped_total Queries dropped because the in-flight limit was reached\n# TYPE xdp_evade_dropped_total counter\nxdp_evade_dropped_total{{proto=\"udp\"}} {}\nxdp_evade_dropped_total{{proto=\"tcp\"}} {}\n# HELP xdp_evade_inflight Queries currently waiting on the upstream resolver\n# TYPE xdp_evade_inflight gauge\nxdp_evade_inflight{{proto=\"udp\"}} {}\nxdp_evade_inflight{{proto=\"tcp\"}} {}\n",
+            stats.evaded_queries_total, stats.evaded_records_total, stats.total_queries_processed,
+            app.counters.dropped_udp.load(Relaxed), app.counters.dropped_tcp.load(Relaxed),
+            app.limits.inflight_udp(), app.limits.inflight_tcp()))
     } else {
         ("application/json", serde_json::to_string_pretty(&stats)?)
     };
@@ -1052,6 +1148,7 @@ mod tests {
             paths,
             test_redirects: HashMap::new(),
             temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+            limits: Limits::default(),
         }
     }
 
@@ -1238,6 +1335,7 @@ mod tests {
             paths: Paths::from_env(true),
             test_redirects: HashMap::new(),
             temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+            limits: Limits::default(),
         };
         assert_eq!(app.rewrite(&mut packet), 1);
         assert_eq!(&packet[packet.len() - 4..], &[104, 16, 1, 2]);
@@ -1275,6 +1373,7 @@ mod tests {
             paths: Paths::from_env(true),
             test_redirects: HashMap::new(),
             temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+            limits: Limits::default(),
         };
         assert_eq!(app.rewrite(&mut packet), 1);
         assert_eq!(&packet[hint_at..hint_at + 4], &[104, 16, 1, 2]);
@@ -1336,9 +1435,76 @@ mod tests {
             paths: Paths::from_env(true),
             test_redirects: rules,
             temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+            limits: Limits::default(),
         };
         assert_eq!(app.rewrite(&mut packet), 1);
         assert_eq!(&packet[packet.len() - 4..], &[203, 0, 113, 7]);
+    }
+
+    fn udp_test_app(limits: Limits) -> Arc<App> {
+        Arc::new(App {
+            data: RwLock::new(Arc::new(Data::default())),
+            counters: Counters::default(),
+            paths: Paths::from_env(true),
+            test_redirects: HashMap::new(),
+            temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+            limits,
+        })
+    }
+
+    const QUERY: [u8; 17] = [
+        0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+    ];
+
+    #[tokio::test]
+    async fn udp_relays_large_responses_intact() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let mut response = QUERY.to_vec();
+        response.resize(9000, 0xab);
+        let expected = response.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            upstream.send_to(&response, peer).await.unwrap();
+        });
+        let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let proxy_addr = proxy.local_addr().unwrap();
+        let app = udp_test_app(Limits::default());
+        tokio::spawn(serve_udp(app.clone(), proxy, upstream_addr));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&QUERY, proxy_addr).await.unwrap();
+        let mut buf = vec![0u8; UDP_LIMIT];
+        let len = timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], &expected[..]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(app.limits.inflight_udp(), 0);
+    }
+
+    #[tokio::test]
+    async fn udp_drops_queries_beyond_the_inflight_limit() {
+        // Upstream that never answers keeps the only slot busy.
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let proxy_addr = proxy.local_addr().unwrap();
+        let app = udp_test_app(Limits::new(1, 1));
+        tokio::spawn(serve_udp(
+            app.clone(),
+            proxy,
+            upstream.local_addr().unwrap(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..3 {
+            client.send_to(&QUERY, proxy_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(app.limits.inflight_udp(), 1);
+        assert_eq!(app.counters.dropped_udp.load(Relaxed), 2);
     }
 
     #[test]
