@@ -121,6 +121,9 @@ fn normalize_domain(domain: &str) -> Result<String> {
 /// sustituta que haya pasado a estar bloqueada, y evita que cada conexión a un
 /// dominio evadido vuelva a consultar al servidor (antes TTL=0).
 const DEFAULT_REWRITE_TTL: u32 = 30;
+// Cap client caching before an address becomes blocked, without changing the
+// upstream Unbound cache. Applies to Cloudflare addresses and SVCB/HTTPS hints.
+const CLOUDFLARE_MAX_TTL: u32 = 30;
 
 #[derive(Clone, Debug)]
 struct Paths {
@@ -382,15 +385,26 @@ impl App {
         } else {
             None
         };
-        if test_redirect.is_none() && data.blocked_v4.is_empty() && data.blocked_v6.is_empty() {
-            return 0;
-        }
         let records = match resource_records(packet) {
             Some(records) => records,
             None => return 0,
         };
         let mut changes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut has_cloudflare = false;
         for rr in &records {
+            // Inspect original addresses even when a temporary redirect applies.
+            match (rr.kind, rr.rdlen) {
+                (1, 4) => {
+                    let ip = u32::from_be_bytes(packet[rr.rdata..rr.rdata + 4].try_into().unwrap());
+                    has_cloudflare |= containing(&data.cf_v4, ip).is_some();
+                }
+                (28, 16) => {
+                    let ip =
+                        u128::from_be_bytes(packet[rr.rdata..rr.rdata + 16].try_into().unwrap());
+                    has_cloudflare |= containing(&data.cf_v6, ip).is_some();
+                }
+                _ => {}
+            }
             if rr.answer {
                 match (rr.kind, rr.rdlen, test_redirect) {
                     (1, 4, Some(redirect)) => {
@@ -434,17 +448,36 @@ impl App {
                 }
                 (64, _) | (65, _) => {
                     let redirect = if rr.answer { test_redirect } else { None };
-                    changes.extend(svcb_hint_changes(packet, rr, data.as_ref(), redirect));
+                    changes.extend(svcb_hint_changes(
+                        packet,
+                        rr,
+                        data.as_ref(),
+                        redirect,
+                        &mut has_cloudflare,
+                    ));
                 }
                 _ => {}
             }
         }
+        if has_cloudflare || !changes.is_empty() {
+            let limit = match (has_cloudflare, changes.is_empty()) {
+                (true, true) => CLOUDFLARE_MAX_TTL,
+                (true, false) => CLOUDFLARE_MAX_TTL.min(self.paths.rewrite_ttl),
+                _ => self.paths.rewrite_ttl,
+            };
+            // Cap the whole response consistently, including mixed RRsets and
+            // aliases, but never raise a shorter TTL or modify pseudo-records.
+            for rr in &records {
+                if matches!(rr.kind, 41 | 249 | 250) {
+                    continue;
+                }
+                let old = u32::from_be_bytes(packet[rr.ttl..rr.ttl + 4].try_into().unwrap());
+                packet[rr.ttl..rr.ttl + 4].copy_from_slice(&old.min(limit).to_be_bytes());
+            }
+        }
+        // TTL-only changes are not IP evasion events.
         if changes.is_empty() {
             return 0;
-        }
-        let ttl = self.paths.rewrite_ttl.to_be_bytes();
-        for rr in records {
-            packet[rr.ttl..rr.ttl + 4].copy_from_slice(&ttl);
         }
         for (offset, bytes) in &changes {
             packet[*offset..*offset + bytes.len()].copy_from_slice(bytes);
@@ -520,6 +553,7 @@ fn svcb_hint_changes(
     rr: &Record,
     data: &Data,
     test_redirect: Option<&TestRedirect>,
+    has_cloudflare: &mut bool,
 ) -> Vec<(usize, Vec<u8>)> {
     let mut changes = Vec::new();
     let end = match rr.rdata.checked_add(rr.rdlen) {
@@ -563,6 +597,7 @@ fn svcb_hint_changes(
                 let mut off = pos;
                 while off + 4 <= vend {
                     let ip = u32::from_be_bytes(packet[off..off + 4].try_into().unwrap());
+                    *has_cloudflare |= containing(&data.cf_v4, ip).is_some();
                     let new = test_redirect.and_then(|r| r.v4).or_else(|| {
                         if data.blocked_v4.contains(&ip) {
                             data.evasive_v4(ip)
@@ -583,6 +618,7 @@ fn svcb_hint_changes(
                 let mut off = pos;
                 while off + 16 <= vend {
                     let ip = u128::from_be_bytes(packet[off..off + 16].try_into().unwrap());
+                    *has_cloudflare |= containing(&data.cf_v6, ip).is_some();
                     let new = test_redirect.and_then(|r| r.v6).or_else(|| {
                         if data.blocked_v6.contains(&ip) {
                             data.evasive_v6(ip)
@@ -1001,6 +1037,185 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preventive_app() -> App {
+        let data = Data {
+            cf_v4: vec![parse_v4_prefix("104.16.0.0/12").unwrap()],
+            cf_v6: vec![parse_v6_prefix("2606:4700::/32").unwrap()],
+            ..Default::default()
+        };
+        let mut paths = Paths::from_env(true);
+        paths.rewrite_ttl = DEFAULT_REWRITE_TTL;
+        App {
+            data: RwLock::new(Arc::new(data)),
+            counters: Counters::default(),
+            paths,
+            test_redirects: HashMap::new(),
+            temporary_redirects: RwLock::new(Arc::new(HashMap::new())),
+        }
+    }
+
+    fn answer_packet(kind: u16, ttl: u32, rdata: &[u8]) -> Vec<u8> {
+        let mut packet = vec![
+            0x12, 0x34, 0x81, 0xa0, 0, 1, 0, 1, 0, 0, 0, 0, 1, b'a', 3, b'c', b'o', b'm', 0,
+        ];
+        packet.extend(kind.to_be_bytes());
+        packet.extend([0, 1, 0xc0, 0x0c]);
+        packet.extend(kind.to_be_bytes());
+        packet.extend([0, 1]);
+        packet.extend(ttl.to_be_bytes());
+        packet.extend((rdata.len() as u16).to_be_bytes());
+        packet.extend(rdata);
+        packet
+    }
+
+    // Mirrors a list reload: the neighbour map is rebuilt, not patched in place.
+    fn block_v4(app: &App, ip: [u8; 4]) {
+        let mut data = app.data.write().unwrap();
+        let mut blocked_v4 = data.blocked_v4.clone();
+        blocked_v4.insert(u32::from_be_bytes(ip));
+        *data = Arc::new(Data::new(
+            blocked_v4,
+            data.blocked_v6.clone(),
+            data.cf_v4.clone(),
+            data.cf_v6.clone(),
+        ));
+    }
+
+    fn ttl_of(packet: &[u8], index: usize) -> u32 {
+        let rr = resource_records(packet).unwrap()[index];
+        u32::from_be_bytes(packet[rr.ttl..rr.ttl + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn caps_unblocked_cloudflare_a_and_aaaa_without_counting_evasion() {
+        let app = preventive_app();
+        for (kind, address) in [
+            (1, vec![104, 16, 1, 1]),
+            (
+                28,
+                "2606:4700::1111"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+                    .octets()
+                    .to_vec(),
+            ),
+        ] {
+            let mut packet = answer_packet(kind, 300, &address);
+            let mut expected = packet.clone();
+            let rr = resource_records(&packet).unwrap()[0];
+            expected[rr.ttl..rr.ttl + 4].copy_from_slice(&30u32.to_be_bytes());
+            assert_eq!(app.rewrite(&mut packet), 0);
+            assert_eq!(packet, expected); // IP, flags (including AD), and RDATA preserved.
+        }
+        assert_eq!(app.counters.evaded_queries.load(Relaxed), 0);
+        assert_eq!(app.counters.evaded_records.load(Relaxed), 0);
+        assert_eq!(app.counters.total_queries.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn caps_unblocked_https_and_svcb_v4_and_v6_hints() {
+        let app = preventive_app();
+        for kind in [64, 65] {
+            for (key, hint) in [
+                (4u16, vec![104, 16, 1, 1]),
+                (
+                    6u16,
+                    "2606:4700::1111"
+                        .parse::<Ipv6Addr>()
+                        .unwrap()
+                        .octets()
+                        .to_vec(),
+                ),
+            ] {
+                let mut rdata = vec![0, 1, 0];
+                rdata.extend(key.to_be_bytes());
+                rdata.extend((hint.len() as u16).to_be_bytes());
+                rdata.extend(hint);
+                let mut packet = answer_packet(kind, 300, &rdata);
+                assert_eq!(app.rewrite(&mut packet), 0);
+                assert_eq!(ttl_of(&packet, 0), 30);
+                assert!(packet.ends_with(&rdata));
+            }
+        }
+    }
+
+    #[test]
+    fn never_raises_ttl_even_when_rewriting() {
+        let app = preventive_app();
+        for blocked in [false, true] {
+            if blocked {
+                block_v4(&app, [104, 16, 1, 1]);
+            }
+            for ttl in [0u32, 1, 5, 29, 30, 31, 300] {
+                let mut packet = answer_packet(1, ttl, &[104, 16, 1, 1]);
+                assert_eq!(app.rewrite(&mut packet), usize::from(blocked));
+                assert_eq!(ttl_of(&packet, 0), ttl.min(30));
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_non_cloudflare_and_hintless_responses_untouched() {
+        let app = preventive_app();
+        for (kind, rdata) in [
+            (1, vec![192, 0, 2, 1]),
+            (
+                28,
+                "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec(),
+            ),
+            (65, vec![0, 1, 0, 0, 4, 0, 4, 192, 0, 2, 1]),
+            (64, vec![0, 1, 0]),
+        ] {
+            let mut packet = answer_packet(kind, 300, &rdata);
+            let original = packet.clone();
+            assert_eq!(app.rewrite(&mut packet), 0);
+            assert_eq!(packet, original);
+        }
+    }
+
+    #[test]
+    fn preserves_edns_flags_and_caps_mixed_rrset_consistently() {
+        let app = preventive_app();
+        let mut packet = answer_packet(1, 300, &[104, 16, 1, 1]);
+        packet[7] = 2;
+        packet[11] = 1;
+        let other = answer_packet(1, 300, &[192, 0, 2, 1]);
+        packet.extend(&other[23..]);
+        // OPT TTL field contains EDNS extended RCODE/version/flags, not a TTL.
+        let opt = [0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0];
+        packet.extend(opt);
+        app.rewrite(&mut packet);
+        assert_eq!(ttl_of(&packet, 0), 30);
+        assert_eq!(ttl_of(&packet, 1), 30);
+        assert!(packet.ends_with(&opt));
+    }
+
+    #[test]
+    fn newly_blocked_address_is_rewritten_from_same_upstream_cached_answer() {
+        let app = preventive_app();
+        let original = answer_packet(1, 3600, &[104, 16, 1, 1]);
+        let mut before = original.clone();
+        assert_eq!(app.rewrite(&mut before), 0);
+        assert_eq!(ttl_of(&before, 0), 30);
+        block_v4(&app, [104, 16, 1, 1]);
+        let mut after = original;
+        assert_eq!(app.rewrite(&mut after), 1);
+        assert_eq!(ttl_of(&after, 0), 30);
+        assert!(after.ends_with(&[104, 16, 1, 2]));
+    }
+
+    #[test]
+    fn malformed_packets_do_not_panic_or_change() {
+        let app = preventive_app();
+        let packet = answer_packet(65, 300, &[0, 1, 0, 0, 4, 0, 4, 104, 16, 1, 1]);
+        for length in 0..packet.len() {
+            let mut truncated = packet[..length].to_vec();
+            let original = truncated.clone();
+            assert_eq!(app.rewrite(&mut truncated), 0);
+            assert_eq!(truncated, original);
+        }
+    }
 
     #[test]
     fn rewrites_a_in_place_and_sets_ttl() {

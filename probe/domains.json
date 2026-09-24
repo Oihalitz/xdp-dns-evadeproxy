@@ -27,6 +27,6 @@
     { "domain": "pagosonline.redsys.es",       "sni": "pagosonline.redsys.es",      "families": [4], "strategy": "verified-pool", "extra_candidates": ["193.16.243.132","195.76.9.23"] },
     { "domain": "steamcommunity.com",          "sni": "steamcommunity.com",         "families": [4], "strategy": "verified-pool", "extra_candidates": ["2.22.208.231","23.46.85.17"] },
     { "domain": "store.steampowered.com",      "sni": "store.steampowered.com",     "families": [4], "strategy": "verified-pool", "extra_candidates": ["2.22.208.231","2.22.210.125","2.17.154.29","23.46.85.17"] },
-    { "domain": "api-docs.deepseek.com",        "sni": "api-docs.deepseek.com",      "families": [4], "strategy": "verified-pool", "extra_candidates": ["43.174.109.86","43.159.109.200","43.242.198.77"] }
+    { "domain": "api-docs.deepseek.com",        "sni": "api-docs.deepseek.com",      "families": [4], "strategy": "verified-pool", "extra_candidates": ["43.159.109.200","43.242.198.77","43.174.109.86"] }
   ]
 }

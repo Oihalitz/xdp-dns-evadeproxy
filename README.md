@@ -74,8 +74,9 @@ cliente → Blocky / DoH / DoT → evade-proxy :5335 → Unbound :5336
 ```
 
 1. Unbound responde con la IP real (DNSSEC).
-2. Si un A, AAAA o hint HTTPS/SVCB está en la blocklist **y** en un prefijo Cloudflare, el proxy la cambia por un vecino del mismo prefijo que no esté listado, y pone TTL 30 s (`EVADE_REWRITE_TTL`; `0` restaura el comportamiento anterior, sin caché en el cliente).
-3. Fuera de Cloudflare no se toca nada. En CDNs no-anycast la sonda fija un `redirect` a una IP **verificada** desde casa y desde el servidor.
+2. Si un A, AAAA o hint HTTPS/SVCB está en la blocklist **y** en un prefijo Cloudflare, el proxy la cambia por un vecino del mismo prefijo que no esté listado y limita el TTL a `EVADE_REWRITE_TTL` (30 s por defecto).
+3. Toda respuesta con direcciones Cloudflare sale con TTL ≤ 30 s aunque no haya bloqueo, para que un corte nuevo llegue a los clientes en segundos. Nunca se sube un TTL menor, no se tocan los pseudo-registros EDNS (OPT) y Unbound conserva su caché.
+4. Fuera de Cloudflare no se toca nada. En CDNs no-anycast la sonda fija un `redirect` a una IP **verificada** desde casa y desde el servidor.
 
 La reescritura es in-place: punteros de compresión, flags y orden de registros se conservan.
 
