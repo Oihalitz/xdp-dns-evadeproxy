@@ -12,6 +12,8 @@ User=root
 EnvironmentFile=-/etc/evade-proxy.env
 RuntimeDirectory=evade-proxy
 RuntimeDirectoryMode=0750
+# Keep the probe's redirects.txt across proxy restarts.
+RuntimeDirectoryPreserve=restart
 StateDirectory=evade-proxy
 StateDirectoryMode=0750
 Environment=EVADE_STATS_FILE=/var/lib/evade-proxy/evade_stats.json
