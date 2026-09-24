@@ -69,16 +69,16 @@ cliente → Blocky / DoH / DoT → evade-proxy :5335 → Unbound :5336
                                    │
                                    ├─ blocked_ips.txt       ← lista pública + sonda IPv4
                                    ├─ blocked_ipv6.txt      ← sonda IPv6
-                                   ├─ cloudflare_prefixes   ← AS13335
+                                   ├─ cloudflare_official   ← rangos oficiales de Cloudflare
                                    └─ redirects.txt         ← sonda (GitHub / Fastly / Akamai)
 ```
 
 1. Unbound responde con la IP real (DNSSEC).
-2. Si un A, AAAA o hint HTTPS/SVCB está en la blocklist **y** en un prefijo Cloudflare, el proxy la cambia por un vecino del mismo prefijo que no esté listado y limita el TTL a `EVADE_REWRITE_TTL` (30 s por defecto).
+2. Si un A, AAAA o hint HTTPS/SVCB está en la blocklist **y** en un rango oficial de Cloudflare, el proxy la cambia por un vecino del mismo rango que no esté listado y limita el TTL a `EVADE_REWRITE_TTL` (30 s por defecto).
 3. Toda respuesta con direcciones Cloudflare sale con TTL ≤ 30 s aunque no haya bloqueo, para que un corte nuevo llegue a los clientes en segundos. Nunca se sube un TTL menor, no se tocan los pseudo-registros EDNS (OPT) y Unbound conserva su caché.
 4. Fuera de Cloudflare no se toca nada. En CDNs no-anycast la sonda fija un `redirect` a una IP **verificada** desde casa y desde el servidor.
 
-La reescritura es in-place: punteros de compresión, flags y orden de registros se conservan.
+La reescritura es in-place: punteros de compresión, flags y orden de registros se conservan. Cuando cambia una dirección, quita el flag AD: la IP nueva ya no coincide con su firma DNSSEC.
 
 ## Compilar
 
@@ -155,7 +155,7 @@ servidor a `127.0.0.1:5335`.
 3. Une las IPs que confirmó la sonda
 4. Escribe `/etc/unbound/blocked_ips.txt` — evade-proxy lo recarga cada 5 s
 5. Une IPv6 de la sonda en `/etc/unbound/blocked_ipv6.txt`
-6. Actualiza prefijos Cloudflare AS13335 (una vez al día)
+6. Actualiza los rangos de Cloudflare (una vez al día): los oficiales (`cloudflare.com/ips-v4`, `ips-v6`), únicos donde se reescribe, y todo AS13335 como referencia. AS13335 incluye `1.1.1.0/24` y prefijos BYOIP de clientes, donde la IP vecina es otro servicio.
 
 No hace falta vaciar la caché del resolver: el proxy reescribe a la salida, también las respuestas ya cacheadas.
 
@@ -189,7 +189,21 @@ Solo conexiones salientes (funciona detrás del NAT). Detalle: [`probe/README.md
 
 Variables: [`evade-proxy.env.example`](evade-proxy.env.example) (`EVADE_REWRITE_TTL` incluido).
 
-Como mucho `EVADE_MAX_INFLIGHT_UDP` (4096) consultas UDP y `EVADE_MAX_INFLIGHT_TCP` (1024) conexiones TCP esperan a Unbound a la vez. Por encima se descartan, en lugar de dejar crecer la memoria durante un flood, y el cliente reintenta. `/metrics` expone `xdp_evade_inflight` y `xdp_evade_dropped_total` por protocolo. Redirects temporales de producción (`/run/evade-proxy/redirects.txt`):
+Como mucho `EVADE_MAX_INFLIGHT_UDP` (4096) consultas UDP y `EVADE_MAX_INFLIGHT_TCP` (1024) conexiones TCP esperan a Unbound a la vez. Por encima se descartan, en lugar de dejar crecer la memoria durante un flood, y el cliente reintenta. Por TCP se atienden varias consultas por conexión (RFC 7766); una conexión inactiva se cierra a los 10 s.
+
+`/metrics` expone, además de los contadores de evasión:
+
+| Métrica | Qué mide |
+|:---|:---|
+| `xdp_evade_inflight{proto}` | consultas esperando a Unbound |
+| `xdp_evade_dropped_total{proto}` | descartadas por el límite |
+| `xdp_evade_upstream_failures_total{proto}` | sin respuesta de Unbound |
+| `xdp_evade_blocked_ips{family}` / `xdp_evade_evadable_ips{family}` | IPs listadas / con vecino libre |
+| `xdp_evade_cloudflare_ranges{family}` | rangos donde se reescribe (0 = evasión apagada) |
+| `xdp_evade_active_redirects` | redirects de la sonda |
+| `xdp_evade_last_reload_timestamp_seconds` | última recarga de las listas |
+
+Las listas solo se vuelven a leer cuando cambian, y un fichero que no se puede leer conserva las entradas anteriores en lugar de apagar la evasión. Redirects temporales de producción (`/run/evade-proxy/redirects.txt`):
 
 ```
 ejemplo.es=104.18.13.102 1787609000
@@ -200,7 +214,7 @@ ejemplo.es=104.18.13.102 1787609000
 ```
 src/main.rs                              evade-proxy
 scripts/update-blocked-ips.sh            lista de IPs + sonda
-scripts/update-cloudflare-prefixes.py    AS13335
+scripts/update-cloudflare-prefixes.py    rangos Cloudflare
 probe/probe-server.py                    ingest + diferencial
 probe/domains.json                       objetivos
 probe/agent/                             sonda de casa

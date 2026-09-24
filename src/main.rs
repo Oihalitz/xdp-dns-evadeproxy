@@ -32,6 +32,10 @@ const UDP_LIMIT: usize = 65_535;
 /// during a flood; clients retry. Overridable with EVADE_MAX_INFLIGHT_UDP/TCP.
 const DEFAULT_MAX_INFLIGHT_UDP: usize = 4096;
 const DEFAULT_MAX_INFLIGHT_TCP: usize = 1024;
+/// How long an idle client TCP connection is kept open for further queries
+/// (RFC 7766 pipelining) before the proxy closes it.
+const TCP_IDLE: Duration = Duration::from_secs(10);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Default, PartialEq)]
 struct TestRedirect {
@@ -158,11 +162,11 @@ impl Paths {
             blocked_v6: value("EVADE_BLOCKED_IPV6_FILE", "/etc/unbound/blocked_ipv6.txt"),
             cf_v4: value(
                 "EVADE_CF_IPV4_FILE",
-                "/etc/unbound/cloudflare_prefixes_v4.txt",
+                "/etc/unbound/cloudflare_official_v4.txt",
             ),
             cf_v6: value(
                 "EVADE_CF_IPV6_FILE",
-                "/etc/unbound/cloudflare_prefixes_v6.txt",
+                "/etc/unbound/cloudflare_official_v6.txt",
             ),
             stats: value(
                 "EVADE_STATS_FILE",
@@ -219,31 +223,46 @@ impl Data {
         }
     }
 
-    async fn load(paths: &Paths, verbose: bool) -> Self {
+    /// Reads the four list files. A file that cannot be read keeps the
+    /// values from `previous` instead of silently switching evasion off.
+    async fn load(paths: &Paths, previous: Option<&Data>) -> Self {
         let (v4, v6, cf4, cf6) = tokio::join!(
             read_lines(&paths.blocked_v4),
             read_lines(&paths.blocked_v6),
             read_lines(&paths.cf_v4),
             read_lines(&paths.cf_v6)
         );
-        let blocked_v4 = v4
-            .iter()
-            .filter_map(|s| Ipv4Addr::from_str(s).ok())
-            .map(u32::from)
-            .collect();
-        let blocked_v6 = v6
-            .iter()
-            .filter_map(|s| Ipv6Addr::from_str(s).ok())
-            .map(u128::from)
-            .collect();
-        let cf_v4 = merge_v4(cf4.iter().filter_map(|s| parse_v4_prefix(s)));
-        let cf_v6 = merge_v6(cf6.iter().filter_map(|s| parse_v6_prefix(s)));
+        let blocked_v4 = match v4 {
+            Some(lines) => lines
+                .iter()
+                .filter_map(|s| Ipv4Addr::from_str(s).ok())
+                .map(u32::from)
+                .collect(),
+            None => previous.map(|p| p.blocked_v4.clone()).unwrap_or_default(),
+        };
+        let blocked_v6 = match v6 {
+            Some(lines) => lines
+                .iter()
+                .filter_map(|s| Ipv6Addr::from_str(s).ok())
+                .map(u128::from)
+                .collect(),
+            None => previous.map(|p| p.blocked_v6.clone()).unwrap_or_default(),
+        };
+        let cf_v4 = match cf4 {
+            Some(lines) => merge_v4(lines.iter().filter_map(|s| parse_v4_prefix(s))),
+            None => previous.map(|p| p.cf_v4.clone()).unwrap_or_default(),
+        };
+        let cf_v6 = match cf6 {
+            Some(lines) => merge_v6(lines.iter().filter_map(|s| parse_v6_prefix(s))),
+            None => previous.map(|p| p.cf_v6.clone()).unwrap_or_default(),
+        };
         let data = Self::new(blocked_v4, blocked_v6, cf_v4, cf_v6);
-        if verbose {
-            eprintln!(
-                "loaded {} blocked IPv4, {} blocked IPv6, {} Cloudflare IPv4 intervals, {} IPv6 intervals",
-                data.blocked_v4.len(), data.blocked_v6.len(), data.cf_v4.len(), data.cf_v6.len()
-            );
+        eprintln!(
+            "loaded {} blocked IPv4, {} blocked IPv6, {} Cloudflare IPv4 intervals, {} IPv6 intervals",
+            data.blocked_v4.len(), data.blocked_v6.len(), data.cf_v4.len(), data.cf_v6.len()
+        );
+        if data.cf_v4.is_empty() && data.cf_v6.is_empty() {
+            eprintln!("warning: no Cloudflare prefixes loaded; evasion is disabled");
         }
         data
     }
@@ -313,6 +332,9 @@ struct Counters {
     last_evaded_bits: AtomicU64,
     dropped_udp: AtomicU64,
     dropped_tcp: AtomicU64,
+    upstream_failures_udp: AtomicU64,
+    upstream_failures_tcp: AtomicU64,
+    last_reload_bits: AtomicU64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -408,8 +430,9 @@ struct App {
 
 impl App {
     async fn new(paths: Paths, test_redirects: HashMap<String, TestRedirect>) -> Arc<Self> {
-        let data = Data::load(&paths, true).await;
+        let data = Data::load(&paths, None).await;
         let counters = Counters::load(&paths.stats).await;
+        counters.last_reload_bits.store(epoch().to_bits(), Relaxed);
         let temporary_redirects = load_temporary_redirects(&paths.redirects).await;
         Arc::new(Self {
             data: RwLock::new(Arc::new(data)),
@@ -540,6 +563,11 @@ impl App {
         }
         for (offset, bytes) in &changes {
             packet[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+        }
+        // The rewritten addresses no longer match their RRSIGs: stop claiming
+        // the answer was DNSSEC-validated (AD flag, header byte 3, bit 0x20).
+        if let Some(flags) = packet.get_mut(3) {
+            *flags &= !0x20;
         }
         let count = changes.len();
         self.counters.evaded_queries.fetch_add(1, Relaxed);
@@ -790,9 +818,14 @@ async fn serve_udp(app: Arc<App>, socket: Arc<UdpSocket>, upstream: SocketAddr) 
         let socket = socket.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Some(mut response) = forward_udp(&query, upstream).await {
-                app.rewrite(&mut response);
-                let _ = socket.send_to(&response, peer).await;
+            match forward_udp(&query, upstream).await {
+                Some(mut response) => {
+                    app.rewrite(&mut response);
+                    let _ = socket.send_to(&response, peer).await;
+                }
+                None => {
+                    app.counters.upstream_failures_udp.fetch_add(1, Relaxed);
+                }
             }
         });
     }
@@ -802,7 +835,7 @@ async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
     let up = UdpSocket::bind((LISTEN_HOST, 0)).await.ok()?;
     up.connect(upstream).await.ok()?;
     up.send(query).await.ok()?;
-    timeout(Duration::from_secs(3), async {
+    timeout(UPSTREAM_TIMEOUT, async {
         loop {
             up.readable().await.ok()?;
             match recv_exact(&up) {
@@ -828,7 +861,12 @@ fn recv_exact(socket: &UdpSocket) -> io::Result<Vec<u8>> {
 
 async fn tcp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
     let listener = TcpListener::bind((LISTEN_HOST, listen)).await?;
-    eprintln!("DNS TCP {LISTEN_HOST}:{listen} -> {UPSTREAM_HOST}:{upstream}");
+    let upstream: SocketAddr = format!("{UPSTREAM_HOST}:{upstream}").parse()?;
+    eprintln!("DNS TCP {LISTEN_HOST}:{listen} -> {upstream}");
+    serve_tcp(app, listener, upstream).await
+}
+
+async fn serve_tcp(app: Arc<App>, listener: TcpListener, upstream: SocketAddr) -> Result<()> {
     loop {
         let (client, _) = listener.accept().await?;
         let Ok(slot) = app.limits.tcp.clone().try_acquire_owned() else {
@@ -843,24 +881,68 @@ async fn tcp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
     }
 }
 
-async fn handle_tcp(app: Arc<App>, mut client: TcpStream, upstream_port: u16) -> Result<()> {
-    let len = timeout(Duration::from_secs(3), client.read_u16()).await?? as usize;
-    let mut query = vec![0; len];
-    timeout(Duration::from_secs(3), client.read_exact(&mut query)).await??;
-    let mut upstream = timeout(
-        Duration::from_secs(3),
-        TcpStream::connect((UPSTREAM_HOST, upstream_port)),
-    )
-    .await??;
-    upstream.write_u16(len as u16).await?;
-    upstream.write_all(&query).await?;
-    let response_len = timeout(Duration::from_secs(3), upstream.read_u16()).await?? as usize;
-    let mut response = vec![0; response_len];
-    timeout(Duration::from_secs(3), upstream.read_exact(&mut response)).await??;
-    app.rewrite(&mut response);
-    client.write_u16(response.len() as u16).await?;
-    client.write_all(&response).await?;
-    Ok(())
+/// Answers every query the client sends on this connection, in order, over a
+/// single upstream connection (RFC 7766), until the client goes idle.
+async fn handle_tcp(app: Arc<App>, mut client: TcpStream, upstream: SocketAddr) -> Result<()> {
+    let mut upstream_conn: Option<TcpStream> = None;
+    loop {
+        let len = match timeout(TCP_IDLE, client.read_u16()).await {
+            Ok(Ok(len)) => len as usize,
+            _ => return Ok(()), // idle, closed by the client, or broken
+        };
+        let mut query = vec![0; len];
+        timeout(UPSTREAM_TIMEOUT, client.read_exact(&mut query)).await??;
+        let mut response = match exchange_tcp(&mut upstream_conn, upstream, &query).await {
+            Ok(response) => response,
+            Err(err) => {
+                app.counters.upstream_failures_tcp.fetch_add(1, Relaxed);
+                return Err(err);
+            }
+        };
+        app.rewrite(&mut response);
+        client.write_all(&tcp_frame(&response)).await?;
+    }
+}
+
+async fn exchange_tcp(
+    conn: &mut Option<TcpStream>,
+    upstream: SocketAddr,
+    query: &[u8],
+) -> Result<Vec<u8>> {
+    loop {
+        // Unbound may close a reused connection while it sits idle; that
+        // deserves one retry on a fresh connection, a fresh failure does not.
+        let reused = conn.is_some();
+        if !reused {
+            *conn = Some(timeout(UPSTREAM_TIMEOUT, TcpStream::connect(upstream)).await??);
+        }
+        let stream = conn.as_mut().expect("connection just set");
+        match tcp_roundtrip(stream, query).await {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                *conn = None;
+                if !reused {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+async fn tcp_roundtrip(stream: &mut TcpStream, query: &[u8]) -> Result<Vec<u8>> {
+    stream.write_all(&tcp_frame(query)).await?;
+    let len = timeout(UPSTREAM_TIMEOUT, stream.read_u16()).await?? as usize;
+    let mut response = vec![0; len];
+    timeout(UPSTREAM_TIMEOUT, stream.read_exact(&mut response)).await??;
+    Ok(response)
+}
+
+/// Length-prefixed DNS message, sent in a single write.
+fn tcp_frame(message: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(message.len() + 2);
+    frame.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    frame.extend_from_slice(message);
+    frame
 }
 
 async fn metrics_server(app: Arc<App>, port: u16) -> Result<()> {
@@ -895,11 +977,7 @@ async fn handle_http(app: Arc<App>, stream: TcpStream) -> Result<()> {
     }
     let stats = app.counters.snapshot();
     let (kind, body) = if metrics {
-        ("text/plain; version=0.0.4", format!(
-            "# HELP xdp_evade_queries_total Total DNS queries rewritten for block evasion\n# TYPE xdp_evade_queries_total counter\nxdp_evade_queries_total {}\n# HELP xdp_evade_records_total Total DNS records replaced for block evasion\n# TYPE xdp_evade_records_total counter\nxdp_evade_records_total {}\n# HELP xdp_evade_queries_processed Total queries processed by evasion proxy\n# TYPE xdp_evade_queries_processed counter\nxdp_evade_queries_processed {}\n# HELP xdp_evade_dropped_total Queries dropped because the in-flight limit was reached\n# TYPE xdp_evade_dropped_total counter\nxdp_evade_dropped_total{{proto=\"udp\"}} {}\nxdp_evade_dropped_total{{proto=\"tcp\"}} {}\n# HELP xdp_evade_inflight Queries currently waiting on the upstream resolver\n# TYPE xdp_evade_inflight gauge\nxdp_evade_inflight{{proto=\"udp\"}} {}\nxdp_evade_inflight{{proto=\"tcp\"}} {}\n",
-            stats.evaded_queries_total, stats.evaded_records_total, stats.total_queries_processed,
-            app.counters.dropped_udp.load(Relaxed), app.counters.dropped_tcp.load(Relaxed),
-            app.limits.inflight_udp(), app.limits.inflight_tcp()))
+        ("text/plain; version=0.0.4", metrics_body(&app, &stats))
     } else {
         ("application/json", serde_json::to_string_pretty(&stats)?)
     };
@@ -908,27 +986,153 @@ async fn handle_http(app: Arc<App>, stream: TcpStream) -> Result<()> {
     Ok(())
 }
 
+fn metrics_body(app: &App, stats: &StatsFile) -> String {
+    use std::fmt::Write;
+    let data = app.data.read().expect("data lock poisoned").clone();
+    let redirects = app
+        .temporary_redirects
+        .read()
+        .expect("redirect lock poisoned")
+        .len();
+    let c = &app.counters;
+    let mut out = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, samples: &[(&str, String)]| {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+        for (labels, value) in samples {
+            let _ = writeln!(out, "{name}{labels} {value}");
+        }
+    };
+    let one = |v: String| [("", v)];
+    metric(
+        "xdp_evade_queries_total",
+        "counter",
+        "Total DNS queries rewritten for block evasion",
+        &one(stats.evaded_queries_total.to_string()),
+    );
+    metric(
+        "xdp_evade_records_total",
+        "counter",
+        "Total DNS records replaced for block evasion",
+        &one(stats.evaded_records_total.to_string()),
+    );
+    metric(
+        "xdp_evade_queries_processed",
+        "counter",
+        "Total queries processed by evasion proxy",
+        &one(stats.total_queries_processed.to_string()),
+    );
+    metric(
+        "xdp_evade_dropped_total",
+        "counter",
+        "Queries dropped because the in-flight limit was reached",
+        &[
+            ("{proto=\"udp\"}", c.dropped_udp.load(Relaxed).to_string()),
+            ("{proto=\"tcp\"}", c.dropped_tcp.load(Relaxed).to_string()),
+        ],
+    );
+    metric(
+        "xdp_evade_inflight",
+        "gauge",
+        "Queries currently waiting on the upstream resolver",
+        &[
+            ("{proto=\"udp\"}", app.limits.inflight_udp().to_string()),
+            ("{proto=\"tcp\"}", app.limits.inflight_tcp().to_string()),
+        ],
+    );
+    metric(
+        "xdp_evade_upstream_failures_total",
+        "counter",
+        "Queries that got no answer from the upstream resolver",
+        &[
+            (
+                "{proto=\"udp\"}",
+                c.upstream_failures_udp.load(Relaxed).to_string(),
+            ),
+            (
+                "{proto=\"tcp\"}",
+                c.upstream_failures_tcp.load(Relaxed).to_string(),
+            ),
+        ],
+    );
+    metric(
+        "xdp_evade_blocked_ips",
+        "gauge",
+        "Addresses in the loaded blocklists",
+        &[
+            ("{family=\"ipv4\"}", data.blocked_v4.len().to_string()),
+            ("{family=\"ipv6\"}", data.blocked_v6.len().to_string()),
+        ],
+    );
+    metric(
+        "xdp_evade_evadable_ips",
+        "gauge",
+        "Blocked addresses with a free neighbour to jump to",
+        &[
+            ("{family=\"ipv4\"}", data.evasion_v4.len().to_string()),
+            ("{family=\"ipv6\"}", data.evasion_v6.len().to_string()),
+        ],
+    );
+    metric(
+        "xdp_evade_cloudflare_ranges",
+        "gauge",
+        "Merged Cloudflare ranges eligible for rewriting",
+        &[
+            ("{family=\"ipv4\"}", data.cf_v4.len().to_string()),
+            ("{family=\"ipv6\"}", data.cf_v6.len().to_string()),
+        ],
+    );
+    metric(
+        "xdp_evade_active_redirects",
+        "gauge",
+        "Temporary redirects set by the residential probe",
+        &one(redirects.to_string()),
+    );
+    metric(
+        "xdp_evade_last_reload_timestamp_seconds",
+        "gauge",
+        "When the lists were last (re)loaded",
+        &one(format!(
+            "{:.0}",
+            f64::from_bits(c.last_reload_bits.load(Relaxed))
+        )),
+    );
+    out
+}
+
 async fn maintenance(app: Arc<App>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut ticks = 0u8;
+    // None forces one reload on the first pass, covering changes made while
+    // App::new was loading.
+    let mut stamps: Option<[FileStamp; 4]> = None;
     loop {
         ticker.tick().await;
         let redirects = load_temporary_redirects(&app.paths.redirects).await;
-        {
-            let mut current = app
-                .temporary_redirects
+        let changed = app
+            .temporary_redirects
+            .read()
+            .expect("redirect lock poisoned")
+            .as_ref()
+            != &redirects;
+        if changed {
+            eprintln!("loaded {} active temporary redirect(s)", redirects.len());
+            *app.temporary_redirects
                 .write()
-                .expect("redirect lock poisoned");
-            if current.as_ref() != &redirects {
-                eprintln!("loaded {} active temporary redirect(s)", redirects.len());
-                *current = Arc::new(redirects);
-            }
+                .expect("redirect lock poisoned") = Arc::new(redirects);
         }
 
         ticks = ticks.wrapping_add(1);
         if ticks % 5 == 0 {
-            let new_data = Data::load(&app.paths, false).await;
-            *app.data.write().expect("data lock poisoned") = Arc::new(new_data);
+            let current = list_stamps(&app.paths).await;
+            if stamps.as_ref() != Some(&current) {
+                let previous = app.data.read().expect("data lock poisoned").clone();
+                let new_data = Data::load(&app.paths, Some(&previous)).await;
+                *app.data.write().expect("data lock poisoned") = Arc::new(new_data);
+                app.counters
+                    .last_reload_bits
+                    .store(epoch().to_bits(), Relaxed);
+                stamps = Some(current);
+            }
             if let Err(err) = save_stats(&app.paths.stats, &app.counters.snapshot()).await {
                 eprintln!("warning: could not persist stats: {err:#}");
             }
@@ -991,15 +1195,42 @@ async fn save_stats(path: &Path, stats: &StatsFile) -> Result<()> {
     Ok(())
 }
 
-async fn read_lines(path: &Path) -> Vec<String> {
-    tokio::fs::read_to_string(path)
-        .await
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
+async fn read_lines(path: &Path) -> Option<Vec<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.starts_with('#'))
+                .map(str::to_owned)
+                .collect(),
+        ),
+        Err(err) => {
+            eprintln!(
+                "warning: cannot read {}: {err}; keeping previous entries",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Modification time and size of a list file, or None if it cannot be read.
+/// The lists are only re-parsed when one of these changes.
+type FileStamp = Option<(SystemTime, u64)>;
+
+async fn file_stamp(path: &Path) -> FileStamp {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+async fn list_stamps(paths: &Paths) -> [FileStamp; 4] {
+    let (a, b, c, d) = tokio::join!(
+        file_stamp(&paths.blocked_v4),
+        file_stamp(&paths.blocked_v6),
+        file_stamp(&paths.cf_v4),
+        file_stamp(&paths.cf_v6)
+    );
+    [a, b, c, d]
 }
 
 fn parse_v4_prefix(text: &str) -> Option<(u32, u32)> {
@@ -1115,10 +1346,12 @@ async fn main() -> Result<()> {
         servers.spawn(udp_server(app.clone(), listen, upstream));
         servers.spawn(tcp_server(app.clone(), listen, upstream));
     }
-    servers.spawn(metrics_server(app, metrics_port));
+    servers.spawn(metrics_server(app.clone(), metrics_port));
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         signal = tokio::signal::ctrl_c() => signal?,
+        _ = sigterm.recv() => {}
         result = servers.join_next() => match result {
             Some(Ok(Err(error))) => return Err(error),
             Some(Err(error)) => return Err(error.into()),
@@ -1127,6 +1360,11 @@ async fn main() -> Result<()> {
         }
     }
     maintenance_task.abort();
+    // systemd stops the service with SIGTERM: keep the counters of the last
+    // few seconds instead of losing them.
+    if let Err(err) = save_stats(&app.paths.stats, &app.counters.snapshot()).await {
+        eprintln!("warning: could not persist stats: {err:#}");
+    }
     Ok(())
 }
 
@@ -1505,6 +1743,88 @@ mod tests {
         }
         assert_eq!(app.limits.inflight_udp(), 1);
         assert_eq!(app.counters.dropped_udp.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn clears_ad_flag_only_when_an_address_is_rewritten() {
+        let app = preventive_app();
+        // answer_packet sets AD (flags 0x81a0).
+        let mut untouched = answer_packet(1, 300, &[104, 16, 1, 1]);
+        app.rewrite(&mut untouched);
+        assert_eq!(untouched[3] & 0x20, 0x20);
+
+        block_v4(&app, [104, 16, 1, 1]);
+        let mut rewritten = answer_packet(1, 300, &[104, 16, 1, 1]);
+        assert_eq!(app.rewrite(&mut rewritten), 1);
+        assert_eq!(rewritten[3] & 0x20, 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_answers_several_queries_on_one_connection() {
+        // Upstream echoes each framed query back, over one connection.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = upstream.accept().await.unwrap();
+                counter.fetch_add(1, Relaxed);
+                tokio::spawn(async move {
+                    while let Ok(len) = conn.read_u16().await {
+                        let mut msg = vec![0; len as usize];
+                        conn.read_exact(&mut msg).await.unwrap();
+                        conn.write_all(&tcp_frame(&msg)).await.unwrap();
+                    }
+                });
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(
+            udp_test_app(Limits::default()),
+            listener,
+            upstream_addr,
+        ));
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        for id in 0..3u8 {
+            let mut query = QUERY.to_vec();
+            query[1] = id;
+            client.write_all(&tcp_frame(&query)).await.unwrap();
+            let len = client.read_u16().await.unwrap() as usize;
+            let mut answer = vec![0; len];
+            client.read_exact(&mut answer).await.unwrap();
+            assert_eq!(answer, query);
+        }
+        assert_eq!(accepted.load(Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unreadable_list_keeps_previous_entries() {
+        let dir = std::env::temp_dir().join(format!("evade-proxy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Paths::from_env(true);
+        paths.blocked_v4 = dir.join("v4");
+        paths.blocked_v6 = dir.join("v6");
+        paths.cf_v4 = dir.join("cf4");
+        paths.cf_v6 = dir.join("cf6");
+        std::fs::write(&paths.blocked_v4, "104.16.1.1\n").unwrap();
+        std::fs::write(&paths.blocked_v6, "").unwrap();
+        std::fs::write(&paths.cf_v4, "104.16.0.0/12\n").unwrap();
+        std::fs::write(&paths.cf_v6, "").unwrap();
+        let first = Data::load(&paths, None).await;
+        assert_eq!(first.evasive_v4(0x6810_0101), Some(0x6810_0102));
+
+        std::fs::remove_file(&paths.blocked_v4).unwrap();
+        std::fs::remove_file(&paths.cf_v4).unwrap();
+        let second = Data::load(&paths, Some(&first)).await;
+        assert_eq!(second.evasive_v4(0x6810_0101), Some(0x6810_0102));
+
+        std::fs::write(&paths.blocked_v4, "").unwrap();
+        let third = Data::load(&paths, Some(&second)).await;
+        assert!(third.blocked_v4.is_empty()); // an empty file is a real update
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
