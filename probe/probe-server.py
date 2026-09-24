@@ -14,6 +14,7 @@ casa?), aplica histéresis y alimenta la evasión:
 Sin logs de navegación en disco. Estado de histéresis en memoria."""
 
 import hmac
+import ipaddress
 import json
 import os
 import socket
@@ -21,6 +22,7 @@ import ssl
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIND = (
@@ -45,15 +47,18 @@ REDIRECT_TTL = 300   # vida del redirect (s); se refresca en cada reporte
 RESOLVE_TTL = 30     # caché de resolución de objetivos (s)
 CONTROL_TTL = 15     # caché del chequeo de control del servidor (s)
 PROBE_TIMEOUT = 6.0
+BLOCK_TTL = 600      # una IP cf-blocklist sin reconfirmar caduca a los 10 min
+CONTROL_WORKERS = 32 # chequeos de control en paralelo por reporte
 
 _lock = threading.Lock()
 _cfg = {"mtime": 0, "domains": []}
 _targets_cache = {"ts": 0, "data": None}
+_control_lock = threading.Lock()
 _control_cache = {}                 # (ip,sni,fam) -> (ts, serving)
 # Histéresis por (domain, family, ip):
 _state = {}                         # key -> {"blocked": int, "serving": int, "last": float}
 _redirects = {}                     # domain -> {4: ip, 6: ip}
-_blocked = {4: set(), 6: set()}     # IPs confirmadas bloqueadas (para los ficheros)
+_blocked = {4: {}, 6: {}}           # IP confirmada bloqueada -> última confirmación
 _probes = {}                        # probe_id -> {last, reports, last_results, last_confirmed}
 
 
@@ -125,12 +130,25 @@ def control_serving(ip, sni, family):
     """¿Sirve la IP desde el propio servidor? (con caché corta)."""
     key = (ip, sni, family)
     now = time.time()
-    hit = _control_cache.get(key)
-    if hit and now - hit[0] < CONTROL_TTL:
-        return hit[1]
+    with _control_lock:
+        hit = _control_cache.get(key)
+        if hit and now - hit[0] < CONTROL_TTL:
+            return hit[1]
     ok, _ = probe_ip(ip, sni, family)
-    _control_cache[key] = (now, ok)
+    with _control_lock:
+        _control_cache[key] = (now, ok)
+        for k in [k for k, v in _control_cache.items() if now - v[0] > CONTROL_TTL]:
+            del _control_cache[k]
     return ok
+
+
+def valid_ip(ip, family):
+    """IP literal de la familia indicada. Lo que llega de la sonda acaba en
+    ficheros que lee el proxy: nada de texto arbitrario (saltos de línea…)."""
+    try:
+        return ipaddress.ip_address(str(ip)).version == family
+    except ValueError:
+        return False
 
 
 # ----------------------------- persistencia -------------------------------
@@ -139,6 +157,41 @@ def _atomic_write_lines(path, lines):
     with open(tmp, "w") as fh:
         fh.write("\n".join(lines) + ("\n" if lines else ""))
     os.replace(tmp, path)
+
+
+def load_blocked_files():
+    """Recupera las IPs confirmadas tras un reinicio. Si la sonda no las
+    reconfirma, caducan igual que las demás (BLOCK_TTL)."""
+    now = time.time()
+    for fam, path in ((6, PROBE_BLOCKED_V6), (4, PROBE_BLOCKED_V4)):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    ip = line.strip()
+                    if ip and not ip.startswith("#") and valid_ip(ip, fam):
+                        _blocked[fam][ip] = now
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"[probe-server] no pude leer {path}: {exc}", flush=True)
+    print(f"[probe-server] IPs bloqueadas recuperadas: v4={len(_blocked[4])} v6={len(_blocked[6])}",
+          flush=True)
+
+
+def expire_blocked(now):
+    for fam in (4, 6):
+        for ip in [ip for ip, ts in _blocked[fam].items() if now - ts > BLOCK_TTL]:
+            del _blocked[fam][ip]
+            print(f"[probe-server] IPv{fam} {ip} caduca: la sonda no la reconfirma", flush=True)
+
+
+def janitor():
+    """Caduca bloqueos aunque la sonda deje de reportar del todo."""
+    while True:
+        time.sleep(60)
+        with _lock:
+            expire_blocked(time.time())
+            flush_blocked_files()
 
 
 def flush_blocked_files():
@@ -206,19 +259,34 @@ def process_report(probe_id, results):
     if probe_id and probe_id not in _probes:
         print(f"[probe-server] sonda conectada: {probe_id}", flush=True)
     # Agrupa por dominio+familia para decidir a nivel de dominio.
+    # 1. Filtra y valida lo reportado (sin lock).
+    checks = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        domain, ip = r.get("domain"), r.get("ip")
+        try:
+            fam = int(r.get("family", 4))
+        except (TypeError, ValueError):
+            continue
+        if not domain or not valid_ip(ip, fam):
+            continue
+        strat, sni = strategy_of(domain, fam)
+        if strat is None:
+            continue  # objetivo no reconocido: ignora (anti-inyección)
+        checks.append((r, domain, fam, str(ip), strat, sni))
+
+    # 2. Chequeos de control del servidor en paralelo y FUERA del lock: cada
+    #    uno puede tardar hasta PROBE_TIMEOUT y antes bloqueaban /status.
+    with ThreadPoolExecutor(max_workers=CONTROL_WORKERS) as pool:
+        controls = list(pool.map(lambda c: control_serving(c[3], c[5], c[2]), checks))
+
     by_dom = {}
     confirmed = []
     with _lock:
-        for r in results:
-            domain, fam, ip = r.get("domain"), int(r.get("family", 4)), r.get("ip")
-            if not domain or not ip:
-                continue
-            strat, sni = strategy_of(domain, fam)
-            if strat is None:
-                continue  # objetivo no reconocido: ignora (anti-inyección)
+        for (r, domain, fam, ip, strat, sni), ctrl in zip(checks, controls):
             serving_home = bool(r.get("serving"))
             # Diferencial: solo cuenta como bloqueo si el servidor SÍ sirve.
-            ctrl = control_serving(ip, sni, fam)
             is_block = (not serving_home) and ctrl
             key = (domain, fam, ip)
             st = _state.setdefault(key, {"blocked": 0, "serving": 0, "last": now})
@@ -243,12 +311,12 @@ def process_report(probe_id, results):
         for (domain, fam, strat, sni), b in by_dom.items():
             if strat == "cf-blocklist":
                 for ip in b["blocked"]:
-                    _blocked[fam].add(ip)
+                    _blocked[fam][ip] = now  # confirma o refresca
                 # revierte los que vuelven a servir de forma estable
                 for ip in list(_blocked[fam]):
                     st = _state.get((domain, fam, ip))
                     if st and st["serving"] >= CLEAR:
-                        _blocked[fam].discard(ip)
+                        _blocked[fam].pop(ip, None)
             elif strat == "verified-pool":
                 fams = _redirects.setdefault(domain, {})
                 if b["blocked"] and b["healthy"]:
@@ -261,6 +329,8 @@ def process_report(probe_id, results):
                     )
                     if st_ok:
                         fams.pop(fam, None)
+
+        expire_blocked(now)
 
         # purga estado viejo (>1h sin ver)
         for k in [k for k, v in _state.items() if now - v["last"] > 3600]:
@@ -353,6 +423,8 @@ def main():
         print("[probe-server] FALTA PROBE_TOKEN; abortando (fail-closed).", flush=True)
         raise SystemExit(1)
     load_config()
+    load_blocked_files()
+    threading.Thread(target=janitor, daemon=True).start()
     srv = ThreadingHTTPServer(BIND, Handler)
     print(f"[probe-server] escuchando en {BIND[0]}:{BIND[1]}", flush=True)
     srv.serve_forever()
