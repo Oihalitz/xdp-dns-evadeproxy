@@ -6,7 +6,7 @@ Bucle: pide objetivos al servidor -> sondea cada IP desde ESTA línea
 El servidor confirma el bloqueo por diferencial y actúa. La sonda no decide nada.
 
 Config por variables de entorno (o /etc/xdp-probe.env):
-  XDP_PROBE_URL    p.ej. https://dns.xdp.es/probe   (sin barra final)
+  XDP_PROBE_URL    p.ej. https://dns1.xdp.es/probe   (sin barra final)
   XDP_PROBE_TOKEN  token compartido (bearer)
   XDP_PROBE_ID     identificador libre de esta sonda (def: hostname)
   XDP_PROBE_INTERVAL  segundos entre rondas (def: el que diga el servidor, o 30)

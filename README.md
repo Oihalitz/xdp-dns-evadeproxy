@@ -171,8 +171,10 @@ En `probe/domains.json`:
 En casa (Raspberry Pi / mini-PC):
 
 ```sh
-sudo ./probe/agent/install-agent.sh https://dns.xdp.es/probe <TOKEN> mi-casa
+sudo ./probe/agent/install-agent.sh https://dns1.xdp.es/probe <TOKEN> mi-casa
 ```
+
+Usa `dns1.xdp.es` y no `dns.xdp.es`: este último también resuelve a nodos que no alojan la ingesta y responden 503.
 
 Solo conexiones salientes (funciona detrás del NAT). Detalle: [`probe/README.md`](probe/README.md).
 

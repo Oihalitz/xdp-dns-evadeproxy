@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """xdp-probe-server — ingesta de sondeos residenciales para xdp.es.
 
-Escucha en 127.0.0.1:8090 (Caddy lo expone en https://dns.xdp.es/probe/*).
+Escucha en 127.0.0.1:8090 (Caddy lo expone en https://dns1.xdp.es/probe/*).
 La sonda de casa (Movistar) pide objetivos, sondea desde su línea y reporta.
 El servidor confirma el bloqueo por DIFERENCIAL (¿sirve desde aquí pero no desde
 casa?), aplica histéresis y alimenta la evasión:

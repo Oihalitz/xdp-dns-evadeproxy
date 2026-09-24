@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Instalador de la sonda xdp-probe en la Raspberry Pi / mini-PC (Debian/Ubuntu/RaspOS).
 # Uso:
-#   sudo ./install-agent.sh https://dns.xdp.es/probe  <TOKEN>  [id-sonda]
+#   sudo ./install-agent.sh https://dns1.xdp.es/probe  <TOKEN>  [id-sonda]
 set -euo pipefail
 
 URL="${1:?uso: install-agent.sh <URL /probe> <TOKEN> [id]}"
