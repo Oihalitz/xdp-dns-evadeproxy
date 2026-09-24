@@ -19,13 +19,25 @@ BACKUP_IPV6="${EVADE_BLOCKED_IPV6_BACKUP:-$PREFIX/data/blocked_ipv6.txt}"
 PROBE_V4="${PROBE_BLOCKED_V4:-/etc/unbound/probe_blocked_ips.txt}"
 PROBE_V6="${PROBE_BLOCKED_V6:-/etc/unbound/probe_blocked_ipv6.txt}"
 
-CF_V4_FILE="${EVADE_CF_IPV4_FILE:-/etc/unbound/cloudflare_prefixes_v4.txt}"
+CF_V4_FILE="${EVADE_CF_IPV4_FILE:-/etc/unbound/cloudflare_official_v4.txt}"
 CF_UPDATE="${PREFIX}/scripts/update-cloudflare-prefixes.py"
 POST_HOOK="${UPDATE_BLOCKED_POST_HOOK:-}"
 
 TEMP_FILE=$(mktemp)
 cleanup() { rm -f "$TEMP_FILE"; }
 trap cleanup EXIT
+
+# Replace DEST with the contents of SRC atomically. The temporary file lives
+# next to DEST so the final mv is a rename: evade-proxy re-reads these lists
+# every few seconds and must never see a truncated or half-written file.
+publish() {
+    local src="$1" dest="$2" tmp
+    mkdir -p "$(dirname "$dest")"
+    tmp=$(mktemp "$(dirname "$dest")/.$(basename "$dest").XXXXXX")
+    cat "$src" > "$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$dest"
+}
 
 # 0. Refresh Cloudflare AS13335 prefixes if missing or older than 24 hours.
 if [[ ! -f "$CF_V4_FILE" ]] || [[ -n "$(find "$CF_V4_FILE" -mtime +1 -print 2>/dev/null)" ]]; then
@@ -48,12 +60,10 @@ if curl -s -f -L --connect-timeout 10 --max-time 20 \
     fi
     COUNT=$(wc -l < "$FILTERED_TEMP")
 
-    mkdir -p "$(dirname "$TARGET_FILE")" "$(dirname "$BACKUP_FILE")"
-
     if [[ ! -f "$TARGET_FILE" ]] || ! cmp -s "$FILTERED_TEMP" "$TARGET_FILE"; then
-        mv "$FILTERED_TEMP" "$TARGET_FILE"
-        chmod 644 "$TARGET_FILE"
-        cp "$TARGET_FILE" "$BACKUP_FILE"
+        publish "$FILTERED_TEMP" "$TARGET_FILE"
+        publish "$FILTERED_TEMP" "$BACKUP_FILE"
+        rm -f "$FILTERED_TEMP"
         echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Blocked IPv4 updated: ${COUNT} active entries (evasion: $([[ $COUNT -gt 0 ]] && echo YES || echo NO))."
         logger -t update-blocked-ips "Blocked IPv4 updated: ${COUNT} active entries" || true
         # No cache flush: evade-proxy rewrites blocked IPs on every response,
@@ -68,14 +78,12 @@ fi
 
 # 2. IPv6 blocklist = optional static list (e.g. OONI) ∪ residential probe.
 if [[ -f "$SOURCE_IPV6" ]] || [[ -f "$PROBE_V6" ]]; then
-    mkdir -p "$(dirname "$TARGET_IPV6")" "$(dirname "$BACKUP_IPV6")"
     V6_TMP=$(mktemp)
     { [[ -f "$SOURCE_IPV6" ]] && cat "$SOURCE_IPV6"; [[ -f "$PROBE_V6" ]] && cat "$PROBE_V6"; } 2>/dev/null \
         | grep -E ':' | sort -u > "$V6_TMP" || true
     if [[ ! -f "$TARGET_IPV6" ]] || ! cmp -s "$V6_TMP" "$TARGET_IPV6"; then
-        cp "$V6_TMP" "$TARGET_IPV6"
-        chmod 644 "$TARGET_IPV6"
-        cp "$V6_TMP" "$BACKUP_IPV6"
+        publish "$V6_TMP" "$TARGET_IPV6"
+        publish "$V6_TMP" "$BACKUP_IPV6"
         echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Blocked IPv6 updated: $(wc -l < "$V6_TMP") entries."
     fi
     rm -f "$V6_TMP"
