@@ -8,6 +8,25 @@ Type=oneshot
 EnvironmentFile=-/etc/evade-proxy.env
 Environment=XDP_PREFIX=/opt/xdp-dns-evadeproxy
 ExecStart=/opt/xdp-dns-evadeproxy/scripts/update-blocked-ips.sh
+NoNewPrivileges=true
+PrivateTmp=true
+# Writes into /etc/unbound (owned by unbound): CAP_DAC_OVERRIDE only.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
 StandardOutput=journal
 StandardError=journal
 

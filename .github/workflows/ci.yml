@@ -15,7 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (report only)
+        run: cargo clippy --locked --all-targets || true
       - name: Test
         run: cargo test --locked
       - name: Release build

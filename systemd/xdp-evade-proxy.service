@@ -22,6 +22,27 @@ ProtectSystem=strict
 ReadOnlyPaths=/etc/unbound
 ReadWritePaths=/var/lib/evade-proxy
 LimitNOFILE=65536
+# Unprivileged ports and world-readable lists: no capability is needed.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Normal use is a few MB; the in-flight limits keep floods bounded.
+MemoryMax=512M
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

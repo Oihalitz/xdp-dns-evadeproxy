@@ -17,6 +17,25 @@ ProtectHome=read-only
 # Writes probe blocklists and evade-proxy temporary redirects.
 ReadWritePaths=/etc/unbound /run/evade-proxy
 PrivateTmp=true
+# /etc/unbound belongs to the unbound user: creating files there needs
+# CAP_DAC_OVERRIDE. Nothing else. dig needs AF_NETLINK.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=256M
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
