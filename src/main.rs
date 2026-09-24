@@ -911,7 +911,9 @@ async fn exchange_tcp(
 ) -> Result<Vec<u8>> {
     loop {
         // Unbound may close a reused connection while it sits idle; that
-        // deserves one retry on a fresh connection, a fresh failure does not.
+        // deserves one retry on a fresh connection. A fresh failure or a
+        // timeout (Unbound dropped the query) does not: retrying would only
+        // double the wait.
         let reused = conn.is_some();
         if !reused {
             *conn = Some(timeout(UPSTREAM_TIMEOUT, TcpStream::connect(upstream)).await??);
@@ -921,7 +923,7 @@ async fn exchange_tcp(
             Ok(response) => return Ok(response),
             Err(err) => {
                 *conn = None;
-                if !reused {
+                if !reused || err.is::<tokio::time::error::Elapsed>() {
                     return Err(err);
                 }
             }
