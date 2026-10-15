@@ -4,7 +4,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -20,7 +20,9 @@ use tokio::{
     time::timeout,
 };
 
-const LISTEN_HOST: &str = "127.0.0.1";
+/// Address the DNS listeners and the metrics endpoint bind to unless
+/// EVADE_LISTEN_HOST says otherwise. Upstream (Unbound) is always loopback.
+const DEFAULT_LISTEN_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const UPSTREAM_HOST: &str = "127.0.0.1";
 const PRODUCTION_PORT_PAIRS: &[(u16, u16)] = &[(5335, 5336), (5337, 5338)];
 const TEST_PORT_PAIRS: &[(u16, u16)] = &[(15335, 5336), (15337, 5338)];
@@ -47,6 +49,7 @@ struct TestRedirect {
 struct RuntimeConfig {
     test_mode: bool,
     redirects: HashMap<String, TestRedirect>,
+    listen_host: IpAddr,
 }
 
 impl RuntimeConfig {
@@ -76,9 +79,11 @@ impl RuntimeConfig {
         if !test_mode && !redirects.is_empty() {
             bail!("--redirect is only accepted together with --test");
         }
+        let listen_host = listen_host_from(std::env::var("EVADE_LISTEN_HOST").ok().as_deref())?;
         Ok(Self {
             test_mode,
             redirects,
+            listen_host,
         })
     }
 
@@ -96,6 +101,20 @@ impl RuntimeConfig {
         } else {
             PRODUCTION_METRICS_PORT
         }
+    }
+}
+
+/// Parses EVADE_LISTEN_HOST. Unset or empty keeps the loopback default; an
+/// invalid value is an error instead of silently falling back, so a typo
+/// cannot leave the resolver unreachable or bound somewhere unexpected.
+fn listen_host_from(value: Option<&str>) -> Result<IpAddr> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(DEFAULT_LISTEN_HOST),
+        Some(raw) => raw
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .with_context(|| format!("invalid EVADE_LISTEN_HOST {raw:?}; expected an IP address")),
     }
 }
 
@@ -861,10 +880,11 @@ fn be16(bytes: &[u8], pos: usize) -> Option<u16> {
     ))
 }
 
-async fn udp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind((LISTEN_HOST, listen)).await?);
+async fn udp_server(app: Arc<App>, host: IpAddr, listen: u16, upstream: u16) -> Result<()> {
+    let listen = SocketAddr::new(host, listen);
+    let socket = Arc::new(UdpSocket::bind(listen).await?);
     let upstream: SocketAddr = format!("{UPSTREAM_HOST}:{upstream}").parse()?;
-    eprintln!("DNS UDP {LISTEN_HOST}:{listen} -> {upstream}");
+    eprintln!("DNS UDP {listen} -> {upstream}");
     serve_udp(app, socket, upstream).await
 }
 
@@ -897,7 +917,9 @@ async fn serve_udp(app: Arc<App>, socket: Arc<UdpSocket>, upstream: SocketAddr) 
 }
 
 async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
-    let up = UdpSocket::bind((LISTEN_HOST, 0)).await.ok()?;
+    // Bind next to the upstream, not the listener: with EVADE_LISTEN_HOST set
+    // to a LAN address the socket must still be able to reach 127.0.0.1.
+    let up = UdpSocket::bind((upstream.ip(), 0)).await.ok()?;
     up.connect(upstream).await.ok()?;
     up.send(query).await.ok()?;
     timeout(UPSTREAM_TIMEOUT, async {
@@ -924,10 +946,11 @@ fn recv_exact(socket: &UdpSocket) -> io::Result<Vec<u8>> {
     SCRATCH.with_borrow_mut(|scratch| socket.try_recv(scratch).map(|len| scratch[..len].to_vec()))
 }
 
-async fn tcp_server(app: Arc<App>, listen: u16, upstream: u16) -> Result<()> {
-    let listener = TcpListener::bind((LISTEN_HOST, listen)).await?;
+async fn tcp_server(app: Arc<App>, host: IpAddr, listen: u16, upstream: u16) -> Result<()> {
+    let listen = SocketAddr::new(host, listen);
+    let listener = TcpListener::bind(listen).await?;
     let upstream: SocketAddr = format!("{UPSTREAM_HOST}:{upstream}").parse()?;
-    eprintln!("DNS TCP {LISTEN_HOST}:{listen} -> {upstream}");
+    eprintln!("DNS TCP {listen} -> {upstream}");
     serve_tcp(app, listener, upstream).await
 }
 
@@ -1012,9 +1035,10 @@ fn tcp_frame(message: &[u8]) -> Vec<u8> {
     frame
 }
 
-async fn metrics_server(app: Arc<App>, port: u16) -> Result<()> {
-    let listener = TcpListener::bind((LISTEN_HOST, port)).await?;
-    eprintln!("metrics HTTP {LISTEN_HOST}:{port}");
+async fn metrics_server(app: Arc<App>, host: IpAddr, port: u16) -> Result<()> {
+    let listen = SocketAddr::new(host, port);
+    let listener = TcpListener::bind(listen).await?;
+    eprintln!("metrics HTTP {listen}");
     loop {
         let (stream, _) = listener.accept().await?;
         let app = app.clone();
@@ -1406,14 +1430,15 @@ async fn main() -> Result<()> {
     }
     let port_pairs = config.port_pairs();
     let metrics_port = config.metrics_port();
+    let host = config.listen_host;
     let app = App::new(paths, config.redirects).await;
     let maintenance_task = tokio::spawn(maintenance(app.clone()));
     let mut servers = tokio::task::JoinSet::new();
     for &(listen, upstream) in port_pairs {
-        servers.spawn(udp_server(app.clone(), listen, upstream));
-        servers.spawn(tcp_server(app.clone(), listen, upstream));
+        servers.spawn(udp_server(app.clone(), host, listen, upstream));
+        servers.spawn(tcp_server(app.clone(), host, listen, upstream));
     }
-    servers.spawn(metrics_server(app.clone(), metrics_port));
+    servers.spawn(metrics_server(app.clone(), host, metrics_port));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -1810,6 +1835,71 @@ mod tests {
         }
         assert_eq!(app.limits.inflight_udp(), 1);
         assert_eq!(app.counters.dropped_udp.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn listen_host_defaults_to_loopback() {
+        assert_eq!(listen_host_from(None).unwrap(), DEFAULT_LISTEN_HOST);
+        assert_eq!(listen_host_from(Some("")).unwrap(), DEFAULT_LISTEN_HOST);
+        assert_eq!(listen_host_from(Some("  ")).unwrap(), DEFAULT_LISTEN_HOST);
+    }
+
+    #[test]
+    fn listen_host_accepts_ipv4_and_ipv6() {
+        assert_eq!(
+            listen_host_from(Some("0.0.0.0")).unwrap(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            listen_host_from(Some(" 10.0.0.5 ")).unwrap(),
+            "10.0.0.5".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            listen_host_from(Some("::")).unwrap(),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            listen_host_from(Some("[::1]")).unwrap(),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn listen_host_rejects_garbage() {
+        assert!(listen_host_from(Some("localhost")).is_err());
+        assert!(listen_host_from(Some("10.0.0.256")).is_err());
+        assert!(listen_host_from(Some("0.0.0.0:53")).is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_listener_off_loopback_still_reaches_loopback_upstream() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            upstream.send_to(&buf[..len], peer).await.unwrap();
+        });
+        // Listening on the wildcard address, as EVADE_LISTEN_HOST=0.0.0.0 does.
+        let proxy = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let proxy_port = proxy.local_addr().unwrap().port();
+        tokio::spawn(serve_udp(
+            udp_test_app(Limits::default()),
+            proxy,
+            upstream_addr,
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&QUERY, ("127.0.0.1", proxy_port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let len = timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], &QUERY[..]);
     }
 
     #[test]
