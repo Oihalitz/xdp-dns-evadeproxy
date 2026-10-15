@@ -189,6 +189,8 @@ Solo conexiones salientes (funciona detrás del NAT). Detalle: [`probe/README.md
 
 Variables: [`evade-proxy.env.example`](evade-proxy.env.example) (`EVADE_REWRITE_TTL` incluido).
 
+`EVADE_LISTEN_HOST` cambia la IP donde escuchan `:5335`, `:5337` y `:5339` (por defecto `127.0.0.1`; acepta IPv4 o IPv6, p. ej. `0.0.0.0` dentro de un pod de Kubernetes o un contenedor con red propia). El upstream sigue siendo `127.0.0.1`. Si escuchas fuera de loopback, limita quién llega al puerto: el proxy no tiene control de acceso propio y sería un resolver abierto.
+
 Como mucho `EVADE_MAX_INFLIGHT_UDP` (4096) consultas UDP y `EVADE_MAX_INFLIGHT_TCP` (1024) conexiones TCP esperan a Unbound a la vez. Por encima se descartan, en lugar de dejar crecer la memoria durante un flood, y el cliente reintenta. Por TCP se atienden varias consultas por conexión (RFC 7766); una conexión inactiva se cierra a los 10 s.
 
 `/metrics` expone, además de los contadores de evasión:
